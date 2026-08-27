@@ -1,0 +1,36 @@
+{
+  "version": "0",
+  "id": "sample-event-id",
+  "detail-type": "GuardDuty Finding",
+  "source": "aws.guardduty",
+  "account": "ACCOUNT_ID",
+  "time": "2026-08-27T12:00:00Z",
+  "region": "us-east-1",
+  "resources": [],
+  "detail": {
+    "schemaVersion": "2.0",
+    "accountId": "ACCOUNT_ID",
+    "region": "us-east-1",
+    "partition": "aws",
+    "id": "sample-guardduty-compute-hijacking",
+    "type": "CryptoCurrency:EC2/BitcoinTool.B!DNS",
+    "resource": {
+      "resourceType": "Instance",
+      "instanceDetails": {
+        "instanceId": "i-0123456789abcdef0",
+        "instanceType": "t3.micro"
+      }
+    },
+    "service": {
+      "serviceName": "guardduty",
+      "eventFirstSeen": "2026-08-27T11:55:00Z",
+      "eventLastSeen": "2026-08-27T12:00:00Z",
+      "count": 1
+    },
+    "severity": 8.0,
+    "title": "Synthetic cryptocurrency activity detected",
+    "description": "Authorized synthetic GuardDuty finding for the Cloud IR Automation Lab.",
+    "createdAt": "2026-08-27T12:00:00Z",
+    "updatedAt": "2026-08-27T12:00:00Z"
+  }
+}

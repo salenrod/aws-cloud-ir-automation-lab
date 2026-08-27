@@ -43,3 +43,9 @@ Thumbs.db
 
 # Temporary evidence before redaction
 docs/evidence/raw/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
