@@ -1,0 +1,45 @@
+# Terraform working directory
+**/.terraform/*
+
+# Terraform state contains infrastructure and potentially sensitive values
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Local Terraform variable files
+terraform.tfvars
+*.auto.tfvars
+
+# Terraform plan files
+*.tfplan
+
+# Terraform crash files
+crash.log
+crash.*.log
+
+# Terraform override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary evidence before redaction
+docs/evidence/raw/
