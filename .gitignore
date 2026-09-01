@@ -49,3 +49,10 @@ docs/evidence/raw/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Lambda deployment packages
+infra/*_lambda.zip
+
+# Generated local test payloads and responses
+events/*-live.json
+events/*-response.json

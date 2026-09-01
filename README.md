@@ -46,3 +46,48 @@ events/                  Safe test events
 tests/                   Automated tests
 docs/                    Architecture, playbooks and evidence
 .github/workflows/        CI validation
+
+## Implemented: GuardDuty finding triage
+
+The project currently includes a read-only AWS Lambda triage stage that:
+
+- accepts GuardDuty-compatible EC2 findings;
+- validates severity and resource type;
+- enriches findings through the EC2 API;
+- requires the explicit `AutoContainment=true` authorization tag;
+- maps cryptocurrency-mining activity to MITRE ATT&CK `T1496.001`;
+- determines containment eligibility without changing the target;
+- produces structured operational logs in CloudWatch.
+
+Validation results:
+
+- 5 isolated Python unit tests passed;
+- 27 live AWS validation controls passed;
+- 0 validation failures;
+- no security group, instance state or incident-status changes during triage.
+
+Detailed evidence is available in
+[`docs/triage-validation.md`](docs/triage-validation.md).
+
+### Validate the triage stage
+
+From the repository root:
+
+`python -m pytest ".\tests\test_triage.py" -q`
+
+`.\scripts\Test-Triage.ps1`
+
+### Roadmap
+
+- [x] Secure isolated AWS foundation
+- [x] GuardDuty-compatible finding normalization
+- [x] EC2 resource enrichment
+- [x] MITRE ATT&CK mapping
+- [x] Read-only containment eligibility decision
+- [x] Automated live validation
+- [ ] EventBridge ingestion
+- [ ] Controlled EC2 quarantine
+- [ ] Incident persistence and idempotency
+- [ ] Evidence collection
+- [ ] Notifications and response orchestration
+- [ ] Operational metrics and post-incident reporting

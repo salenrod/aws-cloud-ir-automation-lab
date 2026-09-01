@@ -184,6 +184,23 @@ The following artifacts must never be committed:
 
 The validation script intentionally reports control status without printing account IDs, resource IDs, ARNs or email addresses.
 
+## AMI lifecycle stability
+
+The lab instance is initially created from the latest Amazon Linux 2023 AMI
+published through the AWS public Systems Manager parameter.
+
+Because the public parameter advances when AWS publishes a new image, using
+its value directly can cause Terraform to propose an unplanned EC2
+replacement. The instance therefore ignores later changes to the `ami`
+attribute after its initial creation.
+
+This preserves the stable target required by the incident-response scenarios
+while keeping other EC2 attributes under Terraform management.
+
+AMI upgrades must be performed as an explicit and reviewed maintenance
+operation. Recreating the disposable lab instance will use the current AMI
+returned by the public parameter.
+
 ## References
 
 - [NIST Cybersecurity Framework 2.0](https://csrc.nist.gov/pubs/cswp/29/the-nist-cybersecurity-framework-csf-20/final)

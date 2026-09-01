@@ -64,3 +64,16 @@ variable "evidence_retention_days" {
     error_message = "Evidence retention must be between 1 and 30 days."
   }
 }
+variable "triage_minimum_severity" {
+  description = "Minimum GuardDuty severity required for automatic containment eligibility."
+  type        = number
+  default     = 7
+
+  validation {
+    condition = (
+      var.triage_minimum_severity >= 0 &&
+      var.triage_minimum_severity <= 10
+    )
+    error_message = "triage_minimum_severity must be between 0 and 10."
+  }
+}

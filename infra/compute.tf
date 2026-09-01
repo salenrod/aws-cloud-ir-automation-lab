@@ -43,4 +43,9 @@ resource "aws_instance" "lab_target" {
     DataClassification = "synthetic"
     InternetExposure   = "none"
   }
+  lifecycle {
+    # Use the latest AL2023 AMI during initial creation, but avoid an
+    # unintended replacement when the public SSM parameter advances.
+    ignore_changes = [ami]
+  }
 }
