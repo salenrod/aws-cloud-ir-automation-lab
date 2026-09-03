@@ -48,6 +48,7 @@ output "sns_confirmation_required" {
   description = "Reminder to confirm the email subscription."
   value       = "Check the configured mailbox and confirm the AWS SNS subscription."
 }
+
 output "triage_lambda_name" {
   description = "Name of the GuardDuty triage Lambda function."
   value       = aws_lambda_function.triage.function_name
@@ -62,6 +63,7 @@ output "triage_log_group_name" {
   description = "CloudWatch Logs group used by the triage Lambda."
   value       = aws_cloudwatch_log_group.triage.name
 }
+
 output "containment_lambda_name" {
   description = "Name of the EC2 containment Lambda function."
   value       = aws_lambda_function.containment.function_name
@@ -75,4 +77,14 @@ output "containment_lambda_arn" {
 output "containment_log_group_name" {
   description = "CloudWatch log group used by the containment Lambda."
   value       = aws_cloudwatch_log_group.containment.name
+}
+
+output "orchestration_state_machine_name" {
+  description = "Name of the Step Functions incident response workflow."
+  value       = aws_sfn_state_machine.incident_response.name
+}
+
+output "orchestration_state_machine_arn" {
+  description = "ARN of the Step Functions incident response workflow."
+  value       = aws_sfn_state_machine.incident_response.arn
 }

@@ -2,7 +2,7 @@
 
 Laboratório de resposta a incidentes em AWS que transforma triagem e contenção de uma instância EC2 em código. O projeto usa Terraform, AWS Lambda, Python e PowerShell para validar um fluxo controlado, auditável e idempotente, baseado em um finding sintético do Amazon GuardDuty.
 
-> Status atual: fundação segura, triagem e contenção controlada implementadas e validadas em AWS.
+> Status atual: fundação segura, triagem, contenção controlada e orquestração com AWS Step Functions implementadas e validadas em AWS.
 
 ## Objetivos
 
@@ -11,6 +11,7 @@ Este projeto foi construído para demonstrar competências práticas esperadas e
 - analisar e enriquecer findings de segurança em ambientes AWS;
 - transformar playbooks manuais em automações Python;
 - aplicar contenção de EC2 com controles fail-closed;
+- orquestrar decisões de resposta com AWS Step Functions;
 - implementar privilégio mínimo com IAM;
 - preservar estado e idempotência com DynamoDB;
 - registrar evidências operacionais em CloudWatch Logs;
@@ -34,14 +35,15 @@ O finding é sintético. O projeto não depende de atividade maliciosa real e, n
 
 ```mermaid
 flowchart TD
-    A["Finding GuardDuty sintético"] --> B["Lambda de triagem"]
-    B -->|Elegível| C["Lambda de contenção"]
-    C --> D["EC2 e SG de quarentena"]
-    C --> E["DynamoDB"]
-    C --> F["SNS e CloudWatch"]
+    A["Finding GuardDuty sintético"] --> B["Step Functions"]
+    B --> C["Lambda de triagem"]
+    C --> D{"Contenção elegível?"}
+    D -->|Sim| E["Lambda de contenção"]
+    D -->|Não| F["Finalizar sem alteração"]
+    E --> G["EC2, DynamoDB, SNS e logs"]
 ```
 
-O script `Test-Containment.ps1` coordena a validação ponta a ponta: cria um identificador de incidente exclusivo, invoca a triagem, entrega o resultado à contenção e verifica o estado real nos serviços AWS.
+O workflow Standard invoca a triagem e usa uma decisão explícita para encaminhar somente findings elegíveis à contenção. O script `Test-Orchestration.ps1` validou o caminho seguro de baixa severidade e comprovou, pelo histórico da execução, que o estado de contenção não foi acessado. A contenção elegível também possui validação ponta a ponta independente por `Test-Containment.ps1`.
 
 ## Componentes
 
@@ -53,6 +55,7 @@ O script `Test-Containment.ps1` coordena a validação ponta a ponta: cria um id
 | EC2 descartável | Alvo autorizado, sem IP público, com IMDSv2 obrigatório e volume raiz criptografado |
 | Lambda de triagem | Normaliza o finding, consulta EC2, aplica guardrails e mapeia MITRE ATT&CK |
 | Lambda de contenção | Revalida o alvo, troca o security group, altera a tag de estado e confirma a mutação |
+| Step Functions | Orquestra triagem, decisão e contenção por um workflow Standard auditável |
 | DynamoDB | Mantém o ledger do incidente, lease de processamento, idempotência e TTL |
 | SNS | Envia a notificação de conclusão da contenção |
 | CloudWatch Logs | Armazena logs estruturados das Lambdas com retenção limitada |
@@ -100,6 +103,7 @@ aws-cloud-ir-automation-lab/
 ├── docs/
 │   ├── containment-validation.md
 │   ├── foundation-validation.md
+│   ├── orchestration-validation.md
 │   └── triage-validation.md
 ├── events/
 │   └── guardduty-crypto-ec2.json
@@ -107,6 +111,7 @@ aws-cloud-ir-automation-lab/
 │   ├── compute.tf
 │   ├── containment.tf
 │   ├── network.tf
+│   ├── orchestration.tf
 │   ├── outputs.tf
 │   ├── providers.tf
 │   ├── storage.tf
@@ -117,6 +122,7 @@ aws-cloud-ir-automation-lab/
 ├── scripts/
 │   ├── Test-Containment.ps1
 │   ├── Test-Foundation.ps1
+│   ├── Test-Orchestration.ps1
 │   └── Test-Triage.ps1
 ├── src/
 │   ├── containment/
@@ -301,6 +307,23 @@ Failed: 0
 
 O teste valida a primeira contenção e repete o mesmo incidente para comprovar idempotência. Ao final, o alvo permanece intencionalmente em quarentena.
 
+### Orquestração segura
+
+Este teste inicia um workflow Standard com severidade abaixo do limite de triagem. Ele valida a decisão sem executar a contenção nem modificar a instância:
+
+```powershell
+.\scripts\Test-Orchestration.ps1
+```
+
+Resultado registrado:
+
+```text
+Passed: 23
+Failed: 0
+```
+
+O histórico confirmou `TriageFinding=entered` e `ContainTarget=not-entered`. Ao final, a instância permaneceu com `IncidentStatus=clean` e com o security group baseline.
+
 ## Recuperação do alvo
 
 Depois da demonstração, restaure o estado baseline:
@@ -358,6 +381,14 @@ O alvo permaneceu no estado baseline após a falha, e o incidente foi registrado
 
 Esse caso demonstra por que testes unitários com mocks devem ser complementados por testes ponta a ponta em uma conta isolada: mocks validam o comportamento da aplicação, mas não reproduzem integralmente a avaliação de autorização da AWS.
 
+## Post-mortem: leitura transitória do S3
+
+Depois da primeira validação da orquestração, um refresh do Terraform informou incorretamente que o bucket de evidências havia sido removido e propôs seis criações e cinco substituições.
+
+O plano não foi aplicado. A investigação confirmou que o bucket continuava existente e acessível por `HeadBucket`, pela API tradicional de tags e por `s3control list-tags-for-resource`. O state também preservava os seis recursos S3. Depois da limpeza do cache DNS, um novo plano retornou `No changes` com exit code `0`.
+
+O evento reforça uma regra operacional do projeto: planos com recriação inesperada de recursos persistentes nunca devem ser aplicados antes da validação direta do recurso e do endpoint usado pelo provider.
+
 ## Custos e limpeza
 
 O desenho evita NAT Gateway e mantém retenções curtas para reduzir custos. Mesmo assim, EC2, CloudWatch, SNS, DynamoDB, S3 e demais serviços podem gerar cobrança.
@@ -384,12 +415,14 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 - [Validação da fundação](docs/foundation-validation.md)
 - [Validação da triagem](docs/triage-validation.md)
 - [Validação da contenção e post-mortem](docs/containment-validation.md)
+- [Validação da orquestração](docs/orchestration-validation.md)
 
 ## Limitações atuais
 
 - o finding GuardDuty é sintético;
-- a execução ponta a ponta é iniciada pelo script PowerShell;
-- ainda não existe orquestração automática por EventBridge, Step Functions ou SOAR;
+- a state machine ainda é iniciada pelo script PowerShell;
+- ainda não existe ingestão automática por GuardDuty/EventBridge nem aprovação humana;
+- o caminho sem contenção foi validado pela Step Functions; a execução elegível pelo workflow será testada separadamente com recuperação controlada;
 - o bucket S3 está preparado para evidências, mas a contenção atual registra seu estado principal no DynamoDB e CloudWatch;
 - o alvo suporta somente o cenário controlado de uma instância com uma interface de rede;
 - o laboratório não substitui um processo forense ou uma estratégia de contenção de produção.
@@ -397,7 +430,7 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 ## Próximas evoluções
 
 - habilitar GuardDuty e integrar findings por EventBridge;
-- orquestrar triagem, contenção, aprovação e recuperação com Step Functions;
+- adicionar aprovação humana e recuperação controlada ao workflow;
 - coletar snapshots e metadados forenses antes da contenção;
 - armazenar evidências normalizadas no S3 com integridade verificável;
 - publicar métricas operacionais de triagem e resposta;
@@ -410,6 +443,9 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 - [Amazon EC2 — ModifyInstanceAttribute](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyInstanceAttribute.html)
 - [AWS CLI — login para desenvolvimento local](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sign-in.html)
 - [AWS SDKs and Tools — shared configuration profiles](https://docs.aws.amazon.com/sdkref/latest/guide/file-format.html)
+- [AWS Step Functions — integração com Lambda](https://docs.aws.amazon.com/step-functions/latest/dg/connect-lambda.html)
+- [AWS Step Functions — Choice state](https://docs.aws.amazon.com/step-functions/latest/dg/state-choice.html)
+- [AWS Step Functions — tipos de workflow](https://docs.aws.amazon.com/step-functions/latest/dg/choosing-workflow-type.html)
 - [Terraform plan command](https://developer.hashicorp.com/terraform/cli/commands/plan)
 - [MITRE ATT&CK T1496.001 — Compute Hijacking](https://attack.mitre.org/techniques/T1496/001/)
 - [NIST Cybersecurity Framework 2.0](https://www.nist.gov/cyberframework)
