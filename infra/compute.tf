@@ -46,6 +46,13 @@ resource "aws_instance" "lab_target" {
   lifecycle {
     # Use the latest AL2023 AMI during initial creation, but avoid an
     # unintended replacement when the public SSM parameter advances.
-    ignore_changes = [ami]
+    #
+    # IncidentStatus and security groups are intentionally changed by the
+    # containment automation during an authorized incident-response exercise.
+    ignore_changes = [
+      ami,
+      tags["IncidentStatus"],
+      vpc_security_group_ids,
+    ]
   }
 }

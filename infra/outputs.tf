@@ -62,3 +62,17 @@ output "triage_log_group_name" {
   description = "CloudWatch Logs group used by the triage Lambda."
   value       = aws_cloudwatch_log_group.triage.name
 }
+output "containment_lambda_name" {
+  description = "Name of the EC2 containment Lambda function."
+  value       = aws_lambda_function.containment.function_name
+}
+
+output "containment_lambda_arn" {
+  description = "ARN of the EC2 containment Lambda function."
+  value       = aws_lambda_function.containment.arn
+}
+
+output "containment_log_group_name" {
+  description = "CloudWatch log group used by the containment Lambda."
+  value       = aws_cloudwatch_log_group.containment.name
+}

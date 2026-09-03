@@ -1,93 +1,415 @@
-# AWS Cloud IR Automation Lab
+# AWS Cloud Incident Response Automation Lab
 
-Laboratório de resposta automatizada a incidentes em AWS, desenvolvido para demonstrar investigação, enriquecimento, contenção, preservação de evidências, métricas e recuperação de uma instância EC2 potencialmente comprometida.
+Laboratório de resposta a incidentes em AWS que transforma triagem e contenção de uma instância EC2 em código. O projeto usa Terraform, AWS Lambda, Python e PowerShell para validar um fluxo controlado, auditável e idempotente, baseado em um finding sintético do Amazon GuardDuty.
 
-## Scenario
+> Status atual: fundação segura, triagem e contenção controlada implementadas e validadas em AWS.
 
-O cenário simula uma instância EC2 envolvida em uso indevido de recursos computacionais.
+## Objetivos
 
-- MITRE ATT&CK: T1496.001 — Compute Hijacking
-- NIST CSF 2.0: Detect, Respond, Recover and Improve
-- Environment: isolated AWS laboratory
-- Default response mode: DRY_RUN
+Este projeto foi construído para demonstrar competências práticas esperadas em uma operação de Cloud Security e SecOps:
 
-No malware or cryptocurrency miner is executed.
+- analisar e enriquecer findings de segurança em ambientes AWS;
+- transformar playbooks manuais em automações Python;
+- aplicar contenção de EC2 com controles fail-closed;
+- implementar privilégio mínimo com IAM;
+- preservar estado e idempotência com DynamoDB;
+- registrar evidências operacionais em CloudWatch Logs;
+- notificar a operação por SNS;
+- provisionar e validar a infraestrutura com Terraform;
+- produzir testes, runbooks e documentação post-mortem.
 
-## Planned architecture
+## Cenário de incidente
 
-1. Amazon GuardDuty detects or simulates a high-severity finding.
-2. Amazon EventBridge sends the finding to AWS Step Functions.
-3. A Python Lambda validates and enriches the finding.
-4. A policy decision determines whether containment is authorized.
-5. The containment Lambda preserves EBS evidence and applies a quarantine security group.
-6. Incident records are stored in Amazon S3 and DynamoDB.
-7. Amazon SNS and CloudWatch provide notification and operational metrics.
-
-## Security guardrails
-
-- Automatic containment requires severity >= 7.0.
-- Automatic containment requires the EC2 tag `AutoContainment=true`.
-- The initial deployment uses `DRY_RUN=true`.
-- The laboratory VPC has no Internet Gateway or NAT Gateway.
-- The EC2 instance has no public IPv4 address.
-- IMDSv2 is mandatory.
-- EBS volumes are encrypted.
-- S3 Block Public Access is enabled.
-- Evidence objects are versioned and expire automatically.
-- Runtime roles follow least privilege.
-
-## Repository structure
+O laboratório utiliza um evento no formato do Amazon EventBridge que representa um finding de criptomineração em EC2:
 
 ```text
-infra/                   Terraform infrastructure
-src/                     Python Lambda functions
-scripts/                 Test, simulation, restoration and cleanup
-events/                  Safe test events
-tests/                   Automated tests
-docs/                    Architecture, playbooks and evidence
-.github/workflows/        CI validation
+CryptoCurrency:EC2/BitcoinTool.B!DNS
+```
 
-## Implemented: GuardDuty finding triage
+A triagem associa esse comportamento à técnica [MITRE ATT&CK T1496.001 — Compute Hijacking](https://attack.mitre.org/techniques/T1496/001/), da tática **Impact**.
 
-The project currently includes a read-only AWS Lambda triage stage that:
+O finding é sintético. O projeto não depende de atividade maliciosa real e, no estágio atual, não habilita um detector GuardDuty nem cria automaticamente uma regra EventBridge.
 
-- accepts GuardDuty-compatible EC2 findings;
-- validates severity and resource type;
-- enriches findings through the EC2 API;
-- requires the explicit `AutoContainment=true` authorization tag;
-- maps cryptocurrency-mining activity to MITRE ATT&CK `T1496.001`;
-- determines containment eligibility without changing the target;
-- produces structured operational logs in CloudWatch.
+## Arquitetura
 
-Validation results:
+```mermaid
+flowchart TD
+    A["Finding GuardDuty sintético"] --> B["Lambda de triagem"]
+    B -->|Elegível| C["Lambda de contenção"]
+    C --> D["EC2 e SG de quarentena"]
+    C --> E["DynamoDB"]
+    C --> F["SNS e CloudWatch"]
+```
 
-- 5 isolated Python unit tests passed;
-- 27 live AWS validation controls passed;
-- 0 validation failures;
-- no security group, instance state or incident-status changes during triage.
+O script `Test-Containment.ps1` coordena a validação ponta a ponta: cria um identificador de incidente exclusivo, invoca a triagem, entrega o resultado à contenção e verifica o estado real nos serviços AWS.
 
-Detailed evidence is available in
-[`docs/triage-validation.md`](docs/triage-validation.md).
+## Componentes
 
-### Validate the triage stage
+| Componente | Responsabilidade |
+| --- | --- |
+| VPC e subnet isolada | Hospedam o alvo sem Internet Gateway, NAT Gateway ou rota padrão para a internet |
+| Security group baseline | Estado normal do alvo; sem regras de entrada |
+| Security group de quarentena | Bloqueia todo o tráfego durante a contenção |
+| EC2 descartável | Alvo autorizado, sem IP público, com IMDSv2 obrigatório e volume raiz criptografado |
+| Lambda de triagem | Normaliza o finding, consulta EC2, aplica guardrails e mapeia MITRE ATT&CK |
+| Lambda de contenção | Revalida o alvo, troca o security group, altera a tag de estado e confirma a mutação |
+| DynamoDB | Mantém o ledger do incidente, lease de processamento, idempotência e TTL |
+| SNS | Envia a notificação de conclusão da contenção |
+| CloudWatch Logs | Armazena logs estruturados das Lambdas com retenção limitada |
+| S3 de evidências | Bucket privado, versionado e criptografado preparado para evidências do laboratório |
+| Terraform | Provisiona, atualiza e verifica drift da infraestrutura |
 
-From the repository root:
+## Controles de segurança
 
-`python -m pytest ".\tests\test_triage.py" -q`
+A contenção só pode ocorrer quando todas as condições abaixo são satisfeitas:
 
-`.\scripts\Test-Triage.ps1`
+- severidade igual ou superior ao limite configurado;
+- recurso afetado do tipo EC2 Instance;
+- instância em estado suportado;
+- instância igual ao alvo explicitamente permitido;
+- tag `AutoContainment=true`;
+- tag `DataClassification=synthetic`;
+- tag inicial `IncidentStatus=clean`;
+- exatamente uma interface de rede;
+- somente o security group baseline associado;
+- security group de quarentena sem nenhuma regra.
 
-### Roadmap
+A Lambda de contenção consulta novamente a EC2 imediatamente antes da mutação. Ela não confia somente no snapshot produzido pela triagem.
 
-- [x] Secure isolated AWS foundation
-- [x] GuardDuty-compatible finding normalization
-- [x] EC2 resource enrichment
-- [x] MITRE ATT&CK mapping
-- [x] Read-only containment eligibility decision
-- [x] Automated live validation
-- [ ] EventBridge ingestion
-- [ ] Controlled EC2 quarantine
-- [ ] Incident persistence and idempotency
-- [ ] Evidence collection
-- [ ] Notifications and response orchestration
-- [ ] Operational metrics and post-incident reporting
+As permissões de alteração são limitadas à instância descartável e ao security group de quarentena gerenciados pelo Terraform. Os recursos reais não são codificados diretamente no repositório.
+
+## Idempotência e estado do incidente
+
+A tabela DynamoDB utiliza `incident_id` como chave e registra, entre outros campos:
+
+- `processing`, `contained` ou `failed`;
+- identificador da instância;
+- tipo e severidade do finding;
+- técnica MITRE;
+- security groups antes e depois da contenção;
+- timestamps de criação, atualização e conclusão;
+- lease temporário de processamento;
+- TTL para expiração dos dados do laboratório.
+
+Uma repetição do mesmo incidente concluído retorna `already_contained`, não modifica novamente a EC2, não repete a notificação e preserva o horário original da conclusão.
+
+## Estrutura do repositório
+
+```text
+aws-cloud-ir-automation-lab/
+├── docs/
+│   ├── containment-validation.md
+│   ├── foundation-validation.md
+│   └── triage-validation.md
+├── events/
+│   └── guardduty-crypto-ec2.json
+├── infra/
+│   ├── compute.tf
+│   ├── containment.tf
+│   ├── network.tf
+│   ├── outputs.tf
+│   ├── providers.tf
+│   ├── storage.tf
+│   ├── terraform.tfvars.example
+│   ├── triage.tf
+│   ├── variables.tf
+│   └── versions.tf
+├── scripts/
+│   ├── Test-Containment.ps1
+│   ├── Test-Foundation.ps1
+│   └── Test-Triage.ps1
+├── src/
+│   ├── containment/
+│   │   ├── __init__.py
+│   │   └── handler.py
+│   └── triage/
+│       ├── __init__.py
+│       └── handler.py
+├── tests/
+│   ├── test_containment.py
+│   └── test_triage.py
+├── .gitignore
+└── README.md
+```
+
+Arquivos `.tfstate`, `.tfvars`, pacotes ZIP de Lambda, planos salvos, caches e ambientes virtuais não devem ser versionados.
+
+## Pré-requisitos
+
+- Windows com PowerShell;
+- AWS CLI v2 com suporte a `aws login`;
+- Terraform CLI;
+- Python e `venv`;
+- conta AWS de laboratório;
+- perfil `cloud-ir-signin` autenticado pelo navegador;
+- perfil `cloud-ir-lab` configurado para exportar credenciais temporárias do perfil de login.
+
+Exemplo conceitual da configuração local:
+
+```ini
+[profile cloud-ir-signin]
+login_session = <identidade-autorizada>
+region = us-east-1
+
+[profile cloud-ir-lab]
+credential_process = aws configure export-credentials --profile cloud-ir-signin --format process
+region = us-east-1
+```
+
+Não armazene access keys no repositório.
+
+## Autenticação para AWS CLI e Terraform
+
+As credenciais de `aws login` são temporárias. Ao iniciar uma nova sessão de trabalho, autentique o perfil de entrada:
+
+```powershell
+aws login `
+  --profile cloud-ir-signin `
+  --region us-east-1
+```
+
+Selecione o perfil operacional para todos os SDKs executados no terminal, inclusive o AWS Provider do Terraform:
+
+```powershell
+$env:AWS_PROFILE = "cloud-ir-lab"
+$env:AWS_REGION = "us-east-1"
+$env:AWS_DEFAULT_REGION = "us-east-1"
+$env:AWS_EC2_METADATA_DISABLED = "true"
+```
+
+Valide tanto o perfil explícito quanto a cadeia de credenciais que o Terraform utilizará:
+
+```powershell
+aws sts get-caller-identity --profile cloud-ir-lab
+aws sts get-caller-identity
+```
+
+Os dois comandos devem retornar a mesma conta e identidade. Se o primeiro funcionar e o segundo falhar, `AWS_PROFILE` não foi definido corretamente na sessão atual.
+
+As variáveis definidas com `$env:` permanecem somente no processo atual do PowerShell. Elas precisam ser configuradas novamente quando um novo terminal for aberto.
+
+## Preparação local
+
+Crie e ative o ambiente virtual:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Instale as dependências usadas nos testes locais:
+
+```powershell
+python -m pip install --upgrade pip
+python -m pip install boto3 pytest
+```
+
+Crie o arquivo local de variáveis:
+
+```powershell
+Copy-Item `
+  ".\infra\terraform.tfvars.example" `
+  ".\infra\terraform.tfvars"
+```
+
+Revise `infra/terraform.tfvars` e informe somente os valores do ambiente, como o endereço de notificação. Esse arquivo não deve ser commitado.
+
+## Provisionamento
+
+Inicialize e valide:
+
+```powershell
+terraform -chdir=".\infra" init
+terraform -chdir=".\infra" fmt -recursive -check
+terraform -chdir=".\infra" validate
+```
+
+Gere um plano revisável:
+
+```powershell
+terraform -chdir=".\infra" plan `
+  -parallelism=1 `
+  -out="cloud-ir-lab.tfplan"
+```
+
+Planos Terraform podem conter dados sensíveis. Não os envie ao Git.
+
+Depois de revisar criação, alteração e destruição:
+
+```powershell
+terraform -chdir=".\infra" apply `
+  ".\cloud-ir-lab.tfplan"
+```
+
+Confirme a assinatura recebida por e-mail para que o SNS possa entregar notificações.
+
+## Testes
+
+### Testes unitários
+
+```powershell
+python -m pytest ".\tests" -q
+```
+
+Resultado registrado:
+
+```text
+13 passed
+```
+
+### Fundação
+
+```powershell
+.\scripts\Test-Foundation.ps1
+```
+
+Resultado registrado:
+
+```text
+Passed: 26
+Failed: 0
+```
+
+### Triagem
+
+```powershell
+.\scripts\Test-Triage.ps1
+```
+
+Resultado registrado:
+
+```text
+Passed: 27
+Failed: 0
+```
+
+### Contenção controlada
+
+Este teste altera o security group e a tag da instância descartável. Revise o script antes de executá-lo:
+
+```powershell
+.\scripts\Test-Containment.ps1 `
+  -ExecuteContainment
+```
+
+Resultado registrado:
+
+```text
+Passed: 54
+Failed: 0
+```
+
+O teste valida a primeira contenção e repete o mesmo incidente para comprovar idempotência. Ao final, o alvo permanece intencionalmente em quarentena.
+
+## Recuperação do alvo
+
+Depois da demonstração, restaure o estado baseline:
+
+```powershell
+$labInstanceId = (
+    terraform -chdir=".\infra" output -raw lab_instance_id
+).Trim()
+
+$baselineSgId = (
+    terraform -chdir=".\infra" output -raw baseline_security_group_id
+).Trim()
+
+aws ec2 modify-instance-attribute `
+  --instance-id $labInstanceId `
+  --groups $baselineSgId `
+  --profile cloud-ir-lab `
+  --region us-east-1
+
+aws ec2 create-tags `
+  --resources $labInstanceId `
+  --tags "Key=IncidentStatus,Value=clean" `
+  --profile cloud-ir-lab `
+  --region us-east-1
+```
+
+Execute novamente as validações de fundação e triagem depois da recuperação.
+
+## Verificação de drift
+
+```powershell
+terraform -chdir=".\infra" plan `
+  -parallelism=1 `
+  -detailed-exitcode
+
+$driftExitCode = $LASTEXITCODE
+Write-Host "Terraform drift exit code: $driftExitCode"
+```
+
+Interpretação:
+
+| Exit code | Significado |
+| ---: | --- |
+| `0` | Plano concluído sem diferenças |
+| `1` | Erro durante o planejamento |
+| `2` | Plano concluído com mudanças |
+
+## Post-mortem: autorização EC2
+
+O primeiro teste real de contenção falhou com `UnauthorizedOperation` em `ec2:ModifyInstanceAttribute`.
+
+A política autorizava somente o ARN da instância, mas a operação também foi avaliada para o security group de destino. O Terraform foi corrigido para permitir a ação exatamente sobre a instância do laboratório e o security group de quarentena, sem utilizar `Resource = "*"`.
+
+O alvo permaneceu no estado baseline após a falha, e o incidente foi registrado como `failed` no DynamoDB. Após a correção IAM, o teste completo passou nas 54 verificações.
+
+Esse caso demonstra por que testes unitários com mocks devem ser complementados por testes ponta a ponta em uma conta isolada: mocks validam o comportamento da aplicação, mas não reproduzem integralmente a avaliação de autorização da AWS.
+
+## Custos e limpeza
+
+O desenho evita NAT Gateway e mantém retenções curtas para reduzir custos. Mesmo assim, EC2, CloudWatch, SNS, DynamoDB, S3 e demais serviços podem gerar cobrança.
+
+Quando o laboratório não for mais necessário, gere e revise primeiro o plano de destruição:
+
+```powershell
+terraform -chdir=".\infra" plan `
+  -destroy `
+  -out="destroy.tfplan"
+```
+
+Somente depois de confirmar os recursos listados:
+
+```powershell
+terraform -chdir=".\infra" apply `
+  ".\destroy.tfplan"
+```
+
+O bucket S3 precisa estar vazio para ser removido, salvo se a configuração definir explicitamente outro comportamento. Trate a destruição como uma operação irreversível.
+
+## Documentação
+
+- [Validação da fundação](docs/foundation-validation.md)
+- [Validação da triagem](docs/triage-validation.md)
+- [Validação da contenção e post-mortem](docs/containment-validation.md)
+
+## Limitações atuais
+
+- o finding GuardDuty é sintético;
+- a execução ponta a ponta é iniciada pelo script PowerShell;
+- ainda não existe orquestração automática por EventBridge, Step Functions ou SOAR;
+- o bucket S3 está preparado para evidências, mas a contenção atual registra seu estado principal no DynamoDB e CloudWatch;
+- o alvo suporta somente o cenário controlado de uma instância com uma interface de rede;
+- o laboratório não substitui um processo forense ou uma estratégia de contenção de produção.
+
+## Próximas evoluções
+
+- habilitar GuardDuty e integrar findings por EventBridge;
+- orquestrar triagem, contenção, aprovação e recuperação com Step Functions;
+- coletar snapshots e metadados forenses antes da contenção;
+- armazenar evidências normalizadas no S3 com integridade verificável;
+- publicar métricas operacionais de triagem e resposta;
+- adicionar CI para testes Python, formatação e validação Terraform;
+- adicionar controles DevSecOps, como análise estática e scan de credenciais.
+
+## Referências
+
+- [Amazon GuardDuty — EC2 finding types](https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_finding-types-ec2.html)
+- [Amazon EC2 — ModifyInstanceAttribute](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyInstanceAttribute.html)
+- [AWS CLI — login para desenvolvimento local](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sign-in.html)
+- [AWS SDKs and Tools — shared configuration profiles](https://docs.aws.amazon.com/sdkref/latest/guide/file-format.html)
+- [Terraform plan command](https://developer.hashicorp.com/terraform/cli/commands/plan)
+- [MITRE ATT&CK T1496.001 — Compute Hijacking](https://attack.mitre.org/techniques/T1496/001/)
+- [NIST Cybersecurity Framework 2.0](https://www.nist.gov/cyberframework)

@@ -77,3 +77,32 @@ variable "triage_minimum_severity" {
     error_message = "triage_minimum_severity must be between 0 and 10."
   }
 }
+variable "incident_retention_days" {
+  description = "Number of days to retain incident ledger records through DynamoDB TTL."
+  type        = number
+  default     = 7
+
+  validation {
+    condition = (
+      var.incident_retention_days >= 1 &&
+      var.incident_retention_days <= 30 &&
+      floor(var.incident_retention_days) == var.incident_retention_days
+    )
+    error_message = "incident_retention_days must be an integer between 1 and 30."
+  }
+}
+
+variable "containment_processing_lease_seconds" {
+  description = "Duration of the DynamoDB processing lease used for containment idempotency."
+  type        = number
+  default     = 60
+
+  validation {
+    condition = (
+      var.containment_processing_lease_seconds >= 30 &&
+      var.containment_processing_lease_seconds <= 300 &&
+      floor(var.containment_processing_lease_seconds) == var.containment_processing_lease_seconds
+    )
+    error_message = "containment_processing_lease_seconds must be an integer between 30 and 300."
+  }
+}
