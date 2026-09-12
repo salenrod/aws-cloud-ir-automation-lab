@@ -2,9 +2,12 @@
 
 ## Purpose
 
-This document describes the safe validation of the AWS Step Functions workflow that connects GuardDuty finding triage to controlled EC2 containment.
+This document describes the validation of the AWS Step Functions workflow that connects GuardDuty finding triage to controlled EC2 containment.
 
-The first orchestration test deliberately uses a severity below the configured triage threshold. It validates the state machine and its conditional branch without changing the EC2 target.
+The validation covers two complementary paths:
+
+- a safe skip path below the configured severity threshold, without changing the EC2 target;
+- an explicitly authorized eligible path that invokes controlled containment and is followed by recovery to the baseline state.
 
 ## Architecture
 
@@ -103,6 +106,54 @@ Python:     13 passed
 Terraform:  No changes, exit code 0
 ```
 
+## Authorized eligible-path validation
+
+The eligible path was validated in AWS on 2026-09-03 with a unique synthetic finding, a severity above the deployed threshold and the disposable allowlisted EC2 target.
+
+The Standard Workflow completed successfully and returned:
+
+```text
+Execution status:     SUCCEEDED
+Incident status:      contained
+Resource changed:     true
+Idempotent replay:    false
+Notification status:  published
+```
+
+The execution history confirmed that the intended states were entered in sequence:
+
+```text
+TriageFinding=entered
+EvaluateContainmentEligibility=entered
+ContainTarget=entered
+```
+
+The output and live AWS evidence agreed across the control plane:
+
+| Evidence source | Recorded result |
+| --- | --- |
+| Step Functions output | `status=contained`, `changed=true`, `idempotent=false` |
+| Execution history | Triage, choice and containment states entered |
+| DynamoDB incident ledger | `status=contained`, completion timestamp and TTL present, processing lease absent |
+| CloudWatch Logs | Structured `containment_complete` event for the same incident |
+| SNS integration | Publish accepted with `notification_status=published` |
+| EC2 before recovery | Quarantine security group and `IncidentStatus=contained` |
+
+The evidence was collected in a temporary local directory and was not added to Git because it contained account-specific resource identifiers.
+
+### Recovery validation
+
+After evidence collection, the target was restored to the baseline security group and its `IncidentStatus` tag was returned to `clean`.
+
+The post-recovery checks succeeded:
+
+```text
+Foundation:  26 passed, 0 failed
+Terraform:   No changes, exit code 0
+```
+
+An earlier foundation run ended with a blank internal error after 25 successful checks. A direct Terraform plan immediately afterward returned `No changes`, and the complete foundation rerun passed 26/26. No infrastructure mutation or code correction was required, so this was recorded as a transient local/provider execution failure rather than an infrastructure defect.
+
 ## Failure investigation
 
 If the execution does not succeed, do not start the containment test. Preserve the diagnostic directory printed by the script and inspect:
@@ -152,13 +203,15 @@ After clearing the local DNS cache, the next Terraform plan returned `No changes
 - The containment Lambda independently revalidates the instance, tags, interface count and security groups.
 - No real account ID, ARN, instance ID or security group ID is stored in this document.
 
-## Next validation
+## Next automation step
 
-After the safe skip path succeeds, a separately authorized test can exercise the eligible path through Step Functions. That test must reuse the established recovery runbook and leave the target in its baseline state when finished.
+Extend `Test-Orchestration.ps1` with an explicit opt-in parameter for the eligible path. The new mode must preserve the current safe behavior by default, verify authorization before mutation, collect Step Functions, DynamoDB and CloudWatch evidence, and restore the target automatically in a `finally` block.
 
 ## References
 
 - [Invoke AWS Lambda with Step Functions](https://docs.aws.amazon.com/step-functions/latest/dg/connect-lambda.html)
 - [Choice workflow state](https://docs.aws.amazon.com/step-functions/latest/dg/state-choice.html)
 - [Choosing a Step Functions workflow type](https://docs.aws.amazon.com/step-functions/latest/dg/choosing-workflow-type.html)
+- [GetExecutionHistory API](https://docs.aws.amazon.com/step-functions/latest/apireference/API_GetExecutionHistory.html)
+- [DynamoDB time to live](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html)
 - [AWS Step Functions pricing](https://aws.amazon.com/step-functions/pricing/)

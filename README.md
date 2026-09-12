@@ -43,7 +43,7 @@ flowchart TD
     E --> G["EC2, DynamoDB, SNS e logs"]
 ```
 
-O workflow Standard invoca a triagem e usa uma decisão explícita para encaminhar somente findings elegíveis à contenção. O script `Test-Orchestration.ps1` validou o caminho seguro de baixa severidade e comprovou, pelo histórico da execução, que o estado de contenção não foi acessado. A contenção elegível também possui validação ponta a ponta independente por `Test-Containment.ps1`.
+O workflow Standard invoca a triagem e usa uma decisão explícita para encaminhar somente findings elegíveis à contenção. Foram validados tanto o caminho seguro de baixa severidade, que não alcança o estado de contenção, quanto o caminho elegível, que executa a quarentena controlada. A contenção também possui validação ponta a ponta independente por `Test-Containment.ps1`.
 
 ## Componentes
 
@@ -307,7 +307,7 @@ Failed: 0
 
 O teste valida a primeira contenção e repete o mesmo incidente para comprovar idempotência. Ao final, o alvo permanece intencionalmente em quarentena.
 
-### Orquestração segura
+### Orquestração
 
 Este teste inicia um workflow Standard com severidade abaixo do limite de triagem. Ele valida a decisão sem executar a contenção nem modificar a instância:
 
@@ -323,6 +323,23 @@ Failed: 0
 ```
 
 O histórico confirmou `TriageFinding=entered` e `ContainTarget=not-entered`. Ao final, a instância permaneceu com `IncidentStatus=clean` e com o security group baseline.
+
+O caminho elegível também foi validado em AWS com um finding sintético autorizado. A execução apresentou:
+
+```text
+Workflow:           SUCCEEDED
+Resultado:          contained
+Recurso alterado:   true
+Idempotente:        false
+Notificação:        published
+Histórico:          TriageFinding -> EvaluateContainmentEligibility -> ContainTarget
+DynamoDB:           status=contained, lease ausente e TTL presente
+CloudWatch Logs:    event=containment_complete
+```
+
+Após a coleta das evidências, o alvo foi restaurado para o security group baseline e `IncidentStatus=clean`. A fundação voltou a passar em `26/26` verificações, e o plano Terraform retornou `No changes` com exit code `0`.
+
+Essa execução elegível foi conduzida de forma assistida. O modo padrão de `Test-Orchestration.ps1` continua não destrutivo e cobre somente o caminho sem contenção.
 
 ## Recuperação do alvo
 
@@ -422,7 +439,7 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 - o finding GuardDuty é sintético;
 - a state machine ainda é iniciada pelo script PowerShell;
 - ainda não existe ingestão automática por GuardDuty/EventBridge nem aprovação humana;
-- o caminho sem contenção foi validado pela Step Functions; a execução elegível pelo workflow será testada separadamente com recuperação controlada;
+- os dois caminhos da Step Functions foram validados, mas a execução elegível ainda não está incorporada ao script automatizado de orquestração;
 - o bucket S3 está preparado para evidências, mas a contenção atual registra seu estado principal no DynamoDB e CloudWatch;
 - o alvo suporta somente o cenário controlado de uma instância com uma interface de rede;
 - o laboratório não substitui um processo forense ou uma estratégia de contenção de produção.
@@ -430,6 +447,7 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 ## Próximas evoluções
 
 - habilitar GuardDuty e integrar findings por EventBridge;
+- incorporar ao `Test-Orchestration.ps1` um modo explícito para o caminho elegível, com recuperação automática do alvo;
 - adicionar aprovação humana e recuperação controlada ao workflow;
 - coletar snapshots e metadados forenses antes da contenção;
 - armazenar evidências normalizadas no S3 com integridade verificável;
