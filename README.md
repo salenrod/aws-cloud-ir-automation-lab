@@ -43,7 +43,7 @@ flowchart TD
     E --> G["EC2, DynamoDB, SNS e logs"]
 ```
 
-O workflow Standard invoca a triagem e usa uma decisão explícita para encaminhar somente findings elegíveis à contenção. Foram validados tanto o caminho seguro de baixa severidade, que não alcança o estado de contenção, quanto o caminho elegível, que executa a quarentena controlada. A contenção também possui validação ponta a ponta independente por `Test-Containment.ps1`.
+O workflow Standard invoca a triagem e usa uma decisão explícita para encaminhar somente findings elegíveis à contenção. O `Test-Orchestration.ps1` valida o caminho seguro por padrão e exige o parâmetro explícito `-ExecuteContainment` para o caminho elegível. Nesse modo autorizado, o script coleta evidências e restaura automaticamente o alvo no bloco `finally`. A contenção também possui validação ponta a ponta independente por `Test-Containment.ps1`.
 
 ## Componentes
 
@@ -324,7 +324,21 @@ Failed: 0
 
 O histórico confirmou `TriageFinding=entered` e `ContainTarget=not-entered`. Ao final, a instância permaneceu com `IncidentStatus=clean` e com o security group baseline.
 
-O caminho elegível também foi validado em AWS com um finding sintético autorizado. A execução apresentou:
+O caminho elegível é executado somente com autorização explícita:
+
+```powershell
+.\scripts\Test-Orchestration.ps1 `
+  -ExecuteContainment
+```
+
+Resultado registrado:
+
+```text
+Passed: 40
+Failed: 0
+```
+
+Essa execução apresentou:
 
 ```text
 Workflow:           SUCCEEDED
@@ -337,13 +351,15 @@ DynamoDB:           status=contained, lease ausente e TTL presente
 CloudWatch Logs:    event=containment_complete
 ```
 
-Após a coleta das evidências, o alvo foi restaurado para o security group baseline e `IncidentStatus=clean`. A fundação voltou a passar em `26/26` verificações, e o plano Terraform retornou `No changes` com exit code `0`.
+O script armazena temporariamente o evento, a descrição e o histórico da execução, o item do DynamoDB, a resposta bruta da consulta ao CloudWatch, o evento de conclusão correlacionado e o estado de recuperação. Esses artefatos permanecem fora do Git porque contêm identificadores específicos da conta.
 
-Essa execução elegível foi conduzida de forma assistida. O modo padrão de `Test-Orchestration.ps1` continua não destrutivo e cobre somente o caminho sem contenção.
+Após a coleta, o bloco `finally` restaura o security group baseline e `IncidentStatus=clean`. A regressão final confirmou a recuperação, `26/26` verificações da fundação e ausência de drift no Terraform.
 
 ## Recuperação do alvo
 
-Depois da demonstração, restaure o estado baseline:
+O modo `-ExecuteContainment` do teste de orquestração tenta restaurar o alvo automaticamente, inclusive quando uma asserção posterior falha. Confirme sempre o estado exibido no resumo.
+
+O teste independente `Test-Containment.ps1` deixa o alvo intencionalmente em quarentena. Depois dessa demonstração, restaure o estado baseline:
 
 ```powershell
 $labInstanceId = (
@@ -406,6 +422,23 @@ O plano não foi aplicado. A investigação confirmou que o bucket continuava ex
 
 O evento reforça uma regra operacional do projeto: planos com recriação inesperada de recursos persistentes nunca devem ser aplicados antes da validação direta do recurso e do endpoint usado pelo provider.
 
+## Post-mortem: falso negativo na validação do CloudWatch
+
+A primeira execução automatizada do caminho elegível concluiu corretamente a Step Functions, a contenção, a persistência no DynamoDB, a notificação SNS e a recuperação do alvo, mas o teste informou que não havia encontrado o evento `containment_complete`.
+
+Uma consulta direta ao log group encontrou exatamente um evento para o mesmo incidente. O registro foi ingerido poucos segundos após sua emissão, descartando atraso prolongado como causa. O problema foi isolado ao filtro literal passado à AWS CLI pelo Windows PowerShell: a automação falhava ao localizar um evento que já estava armazenado.
+
+O validador foi corrigido para:
+
+- consultar o intervalo de tempo sem `--filter-pattern` e correlacionar localmente o ID do incidente e o nome do evento;
+- iniciar a janela cinco minutos antes da execução;
+- repetir a consulta até 20 vezes, com intervalo de três segundos;
+- preservar a resposta bruta em `cloudwatch-query.json`;
+- salvar as evidências de Step Functions e DynamoDB antes da asserção do CloudWatch;
+- executar a recuperação automática em `finally`.
+
+Depois da correção, o caminho seguro passou em `23/23`, o caminho elegível passou em `40/40`, a fundação passou em `26/26` e o Terraform confirmou ausência de drift.
+
 ## Custos e limpeza
 
 O desenho evita NAT Gateway e mantém retenções curtas para reduzir custos. Mesmo assim, EC2, CloudWatch, SNS, DynamoDB, S3 e demais serviços podem gerar cobrança.
@@ -439,7 +472,7 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 - o finding GuardDuty é sintético;
 - a state machine ainda é iniciada pelo script PowerShell;
 - ainda não existe ingestão automática por GuardDuty/EventBridge nem aprovação humana;
-- os dois caminhos da Step Functions foram validados, mas a execução elegível ainda não está incorporada ao script automatizado de orquestração;
+- o modo elegível é explicitamente opt-in e limitado ao alvo descartável; a recuperação local é best-effort e ainda depende de credenciais e conectividade com a AWS;
 - o bucket S3 está preparado para evidências, mas a contenção atual registra seu estado principal no DynamoDB e CloudWatch;
 - o alvo suporta somente o cenário controlado de uma instância com uma interface de rede;
 - o laboratório não substitui um processo forense ou uma estratégia de contenção de produção.
@@ -447,7 +480,6 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 ## Próximas evoluções
 
 - habilitar GuardDuty e integrar findings por EventBridge;
-- incorporar ao `Test-Orchestration.ps1` um modo explícito para o caminho elegível, com recuperação automática do alvo;
 - adicionar aprovação humana e recuperação controlada ao workflow;
 - coletar snapshots e metadados forenses antes da contenção;
 - armazenar evidências normalizadas no S3 com integridade verificável;
@@ -464,6 +496,7 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 - [AWS Step Functions — integração com Lambda](https://docs.aws.amazon.com/step-functions/latest/dg/connect-lambda.html)
 - [AWS Step Functions — Choice state](https://docs.aws.amazon.com/step-functions/latest/dg/state-choice.html)
 - [AWS Step Functions — tipos de workflow](https://docs.aws.amazon.com/step-functions/latest/dg/choosing-workflow-type.html)
+- [Amazon CloudWatch Logs — FilterLogEvents API](https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_FilterLogEvents.html)
 - [Terraform plan command](https://developer.hashicorp.com/terraform/cli/commands/plan)
 - [MITRE ATT&CK T1496.001 — Compute Hijacking](https://attack.mitre.org/techniques/T1496/001/)
 - [NIST Cybersecurity Framework 2.0](https://www.nist.gov/cyberframework)

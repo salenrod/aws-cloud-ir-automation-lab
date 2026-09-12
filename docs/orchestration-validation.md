@@ -41,7 +41,7 @@ Only transient Lambda service errors are retried automatically. Application and 
 
 ## Safe validation scenario
 
-`Test-Orchestration.ps1` performs the following checks:
+By default, `Test-Orchestration.ps1` performs the following checks:
 
 1. Confirms that AWS CLI, Terraform and the synthetic finding template are present.
 2. Resolves the deployed state machine and target through Terraform outputs.
@@ -55,6 +55,8 @@ Only transient Lambda service errors are retried automatically. Application and 
 10. Confirms that the EC2 security group and incident tag remain unchanged.
 
 The test does not insert a containment record into DynamoDB because the containment Lambda is intentionally not invoked on the skip path.
+
+The optional `-ExecuteContainment` mode adds fail-closed preconditions, executes the eligible path, collects control-plane evidence and restores the disposable target in a `finally` block.
 
 ## Commands
 
@@ -154,6 +156,57 @@ Terraform:   No changes, exit code 0
 
 An earlier foundation run ended with a blank internal error after 25 successful checks. A direct Terraform plan immediately afterward returned `No changes`, and the complete foundation rerun passed 26/26. No infrastructure mutation or code correction was required, so this was recorded as a transient local/provider execution failure rather than an infrastructure defect.
 
+## Automated eligible-path validation
+
+The eligible path is now part of the validator as an explicit opt-in mode. Run it only against the disposable laboratory target:
+
+```powershell
+.\scripts\Test-Orchestration.ps1 `
+  -ExecuteContainment
+```
+
+Before mutation, the script verifies the deployed state machine, the severity threshold, the allowlisted instance, its authorization and data-classification tags, its single network interface, its baseline security group and the empty quarantine security group.
+
+The regression completed successfully on 2026-09-12:
+
+```text
+Safe skip:       23 passed, 0 failed
+Eligible path:   40 passed, 0 failed
+Foundation:      26 passed, 0 failed
+Terraform drift: No changes, exit code 0
+```
+
+The eligible execution reached `TriageFinding`, `EvaluateContainmentEligibility` and `ContainTarget`; recorded `status=contained` in DynamoDB; published the SNS notification; emitted `containment_complete`; and returned the target to `IncidentStatus=clean` with only the baseline security group.
+
+### Diagnostic artifacts
+
+The script preserves a temporary evidence directory and prints its path. It can contain:
+
+| File | Evidence |
+| --- | --- |
+| `guardduty-event.json` | Exact synthetic input used by the execution |
+| `describe-execution.json` | Final Step Functions status, input and output |
+| `execution-history.json` | State transition history |
+| `dynamodb-key.json` | Key used to retrieve the incident ledger entry |
+| `dynamodb-item.json` | Persisted containment status and metadata |
+| `cloudwatch-query.json` | Raw CloudWatch Logs query response |
+| `containment-log-event.json` | Correlated structured completion event |
+| `recovery-state.json` | Verified EC2 state after automatic recovery |
+
+These artifacts are intentionally excluded from Git because they contain account-specific identifiers.
+
+### Recovery behavior
+
+Automatic recovery runs in `finally` after the opt-in mode has armed mutation. If the Step Functions execution is still running, the script attempts to stop it before restoring the baseline security group and the `IncidentStatus=clean` tag. Recovery is best-effort and must still be verified from the summary and `recovery-state.json`.
+
+## Post-mortem: CloudWatch validation false negative
+
+The first automated eligible-path run completed the operational response but failed its final CloudWatch assertion. A direct `FilterLogEvents` query found exactly one `containment_complete` event for the same incident; ingestion occurred only a few seconds after emission.
+
+The fault was isolated to the literal server-side filter passed through Windows PowerShell, not to the Lambda logging path. The validator was changed to query the bounded time range without `--filter-pattern`, correlate the incident ID and event name locally, begin five minutes before execution, retry up to 20 times at three-second intervals and persist the raw response before evaluating the result.
+
+The corrected script then passed both branches and automatic recovery. This distinguishes a detection-control defect from an incident-response defect: the response had succeeded, but the evidence collector reported a false negative.
+
 ## Failure investigation
 
 If the execution does not succeed, do not start the containment test. Preserve the diagnostic directory printed by the script and inspect:
@@ -203,9 +256,9 @@ After clearing the local DNS cache, the next Terraform plan returned `No changes
 - The containment Lambda independently revalidates the instance, tags, interface count and security groups.
 - No real account ID, ARN, instance ID or security group ID is stored in this document.
 
-## Next automation step
+## Next evolution
 
-Extend `Test-Orchestration.ps1` with an explicit opt-in parameter for the eligible path. The new mode must preserve the current safe behavior by default, verify authorization before mutation, collect Step Functions, DynamoDB and CloudWatch evidence, and restore the target automatically in a `finally` block.
+Connect the state machine to a narrowly scoped EventBridge rule so a synthetic GuardDuty-shaped event can start the workflow without a manual PowerShell invocation. A production-oriented version should add human approval, central evidence storage and recovery orchestration that does not depend on the analyst workstation.
 
 ## References
 
@@ -213,5 +266,6 @@ Extend `Test-Orchestration.ps1` with an explicit opt-in parameter for the eligib
 - [Choice workflow state](https://docs.aws.amazon.com/step-functions/latest/dg/state-choice.html)
 - [Choosing a Step Functions workflow type](https://docs.aws.amazon.com/step-functions/latest/dg/choosing-workflow-type.html)
 - [GetExecutionHistory API](https://docs.aws.amazon.com/step-functions/latest/apireference/API_GetExecutionHistory.html)
+- [FilterLogEvents API](https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_FilterLogEvents.html)
 - [DynamoDB time to live](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html)
 - [AWS Step Functions pricing](https://aws.amazon.com/step-functions/pricing/)
