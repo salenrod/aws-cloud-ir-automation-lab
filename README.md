@@ -2,7 +2,7 @@
 
 Laboratório de resposta a incidentes em AWS que transforma triagem e contenção de uma instância EC2 em código. O projeto usa Terraform, AWS Lambda, Python e PowerShell para validar um fluxo controlado, auditável e idempotente, baseado em um finding sintético do Amazon GuardDuty.
 
-> Status atual: fundação segura, triagem, contenção controlada e orquestração com AWS Step Functions implementadas e validadas em AWS.
+> Status atual: fundação segura, triagem, contenção controlada, orquestração com AWS Step Functions e ingestão sintética por Amazon EventBridge implementadas e validadas em AWS.
 
 ## Objetivos
 
@@ -12,6 +12,8 @@ Este projeto foi construído para demonstrar competências práticas esperadas e
 - transformar playbooks manuais em automações Python;
 - aplicar contenção de EC2 com controles fail-closed;
 - orquestrar decisões de resposta com AWS Step Functions;
+- receber eventos de segurança por um barramento EventBridge isolado;
+- encaminhar somente eventos compatíveis com uma regra fail-closed;
 - implementar privilégio mínimo com IAM;
 - preservar estado e idempotência com DynamoDB;
 - registrar evidências operacionais em CloudWatch Logs;
@@ -29,21 +31,24 @@ CryptoCurrency:EC2/BitcoinTool.B!DNS
 
 A triagem associa esse comportamento à técnica [MITRE ATT&CK T1496.001 — Compute Hijacking](https://attack.mitre.org/techniques/T1496/001/), da tática **Impact**.
 
-O finding é sintético. O projeto não depende de atividade maliciosa real e, no estágio atual, não habilita um detector GuardDuty nem cria automaticamente uma regra EventBridge.
+O finding é sintético. O projeto não depende de atividade maliciosa real e não habilita um detector GuardDuty. Para manter o teste isolado, o evento é publicado em um barramento EventBridge customizado com uma origem exclusiva do laboratório.
 
 ## Arquitetura
 
 ```mermaid
 flowchart TD
-    A["Finding GuardDuty sintético"] --> B["Step Functions"]
-    B --> C["Lambda de triagem"]
-    C --> D{"Contenção elegível?"}
-    D -->|Sim| E["Lambda de contenção"]
-    D -->|Não| F["Finalizar sem alteração"]
-    E --> G["EC2, DynamoDB, SNS e logs"]
+    A["Finding sintético"] --> B["EventBridge isolado"]
+    B --> C["Step Functions"]
+    C --> D["Lambda de triagem"]
+    D --> E{"Contenção elegível?"}
+    E -->|Sim| F["Lambda de contenção"]
+    E -->|Não| G["Finalizar sem alteração"]
+    F --> H["EC2, DynamoDB, SNS e logs"]
 ```
 
-O workflow Standard invoca a triagem e usa uma decisão explícita para encaminhar somente findings elegíveis à contenção. O `Test-Orchestration.ps1` valida o caminho seguro por padrão e exige o parâmetro explícito `-ExecuteContainment` para o caminho elegível. Nesse modo autorizado, o script coleta evidências e restaura automaticamente o alvo no bloco `finally`. A contenção também possui validação ponta a ponta independente por `Test-Containment.ps1`.
+Uma regra EventBridge aceita somente a origem sintética, o detail type de finding e recursos EC2 Instance. O destino é o workflow Standard, que invoca a triagem e usa uma decisão explícita para encaminhar somente findings elegíveis à contenção. Entregas que não alcançam o destino usam política curta de retry e uma SQS DLQ.
+
+O `Test-EventBridge.ps1` valida por padrão o caminho orientado a evento com severidade abaixo do limite, sem executar contenção. O `Test-Orchestration.ps1` também valida o caminho seguro diretamente e exige o parâmetro explícito `-ExecuteContainment` para o caminho elegível. Nesse modo autorizado, o script coleta evidências e restaura automaticamente o alvo no bloco `finally`. A contenção possui validação ponta a ponta independente por `Test-Containment.ps1`.
 
 ## Componentes
 
@@ -55,6 +60,8 @@ O workflow Standard invoca a triagem e usa uma decisão explícita para encaminh
 | EC2 descartável | Alvo autorizado, sem IP público, com IMDSv2 obrigatório e volume raiz criptografado |
 | Lambda de triagem | Normaliza o finding, consulta EC2, aplica guardrails e mapeia MITRE ATT&CK |
 | Lambda de contenção | Revalida o alvo, troca o security group, altera a tag de estado e confirma a mutação |
+| EventBridge | Recebe findings sintéticos em um barramento isolado e encaminha somente eventos compatíveis |
+| SQS DLQ | Preserva eventos cuja entrega ao workflow falha após as tentativas configuradas |
 | Step Functions | Orquestra triagem, decisão e contenção por um workflow Standard auditável |
 | DynamoDB | Mantém o ledger do incidente, lease de processamento, idempotência e TTL |
 | SNS | Envia a notificação de conclusão da contenção |
@@ -102,6 +109,7 @@ Uma repetição do mesmo incidente concluído retorna `already_contained`, não 
 aws-cloud-ir-automation-lab/
 ├── docs/
 │   ├── containment-validation.md
+│   ├── eventbridge-validation.md
 │   ├── foundation-validation.md
 │   ├── orchestration-validation.md
 │   └── triage-validation.md
@@ -110,6 +118,7 @@ aws-cloud-ir-automation-lab/
 ├── infra/
 │   ├── compute.tf
 │   ├── containment.tf
+│   ├── eventbridge.tf
 │   ├── network.tf
 │   ├── orchestration.tf
 │   ├── outputs.tf
@@ -121,6 +130,7 @@ aws-cloud-ir-automation-lab/
 │   └── versions.tf
 ├── scripts/
 │   ├── Test-Containment.ps1
+│   ├── Test-EventBridge.ps1
 │   ├── Test-Foundation.ps1
 │   ├── Test-Orchestration.ps1
 │   └── Test-Triage.ps1
@@ -355,6 +365,34 @@ O script armazena temporariamente o evento, a descrição e o histórico da exec
 
 Após a coleta, o bloco `finally` restaura o security group baseline e `IncidentStatus=clean`. A regressão final confirmou a recuperação, `26/26` verificações da fundação e ausência de drift no Terraform.
 
+### Ingestão orientada a evento
+
+Este teste publica um único finding sintético de baixa severidade no barramento customizado. A regra encaminha o evento ao workflow, mas a triagem segue o caminho seguro e não executa a contenção:
+
+```powershell
+.\scripts\Test-EventBridge.ps1
+```
+
+Resultado registrado:
+
+```text
+Passed: 37
+Failed: 0
+```
+
+A validação confirmou que:
+
+- o evento EC2 compatível corresponde ao event pattern;
+- um evento com `resourceType=S3Bucket` não corresponde ao pattern;
+- o EventBridge aceitou a publicação sem entradas com falha;
+- o destino iniciou exatamente uma execução correlacionada do workflow;
+- a execução terminou em `SUCCEEDED` e retornou `status=skipped`;
+- `TriageFinding` foi executado e `ContainTarget` não foi alcançado;
+- a instância permaneceu `clean` e com o security group baseline;
+- a DLQ permaneceu vazia.
+
+O script preserva em um diretório temporário o evento publicado, as respostas de `PutEvents`, Step Functions e DLQ e os resultados locais de correspondência do pattern. Esses artefatos não devem ser versionados porque contêm identificadores específicos do ambiente.
+
 ## Recuperação do alvo
 
 O modo `-ExecuteContainment` do teste de orquestração tenta restaurar o alvo automaticamente, inclusive quando uma asserção posterior falha. Confirme sempre o estado exibido no resumo.
@@ -466,12 +504,13 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 - [Validação da triagem](docs/triage-validation.md)
 - [Validação da contenção e post-mortem](docs/containment-validation.md)
 - [Validação da orquestração](docs/orchestration-validation.md)
+- [Validação da ingestão por EventBridge](docs/eventbridge-validation.md)
 
 ## Limitações atuais
 
 - o finding GuardDuty é sintético;
-- a state machine ainda é iniciada pelo script PowerShell;
-- ainda não existe ingestão automática por GuardDuty/EventBridge nem aprovação humana;
+- a ingestão usa um barramento customizado e uma origem exclusiva do laboratório, não findings reais do GuardDuty no barramento default;
+- ainda não existe aprovação humana;
 - o modo elegível é explicitamente opt-in e limitado ao alvo descartável; a recuperação local é best-effort e ainda depende de credenciais e conectividade com a AWS;
 - o bucket S3 está preparado para evidências, mas a contenção atual registra seu estado principal no DynamoDB e CloudWatch;
 - o alvo suporta somente o cenário controlado de uma instância com uma interface de rede;
@@ -479,7 +518,7 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 
 ## Próximas evoluções
 
-- habilitar GuardDuty e integrar findings por EventBridge;
+- habilitar GuardDuty e integrar findings reais pelo barramento default em um ambiente dedicado;
 - adicionar aprovação humana e recuperação controlada ao workflow;
 - coletar snapshots e metadados forenses antes da contenção;
 - armazenar evidências normalizadas no S3 com integridade verificável;
@@ -496,6 +535,11 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 - [AWS Step Functions — integração com Lambda](https://docs.aws.amazon.com/step-functions/latest/dg/connect-lambda.html)
 - [AWS Step Functions — Choice state](https://docs.aws.amazon.com/step-functions/latest/dg/state-choice.html)
 - [AWS Step Functions — tipos de workflow](https://docs.aws.amazon.com/step-functions/latest/dg/choosing-workflow-type.html)
+- [Amazon EventBridge — event buses](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-event-bus.html)
+- [Amazon EventBridge — event patterns](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-event-patterns.html)
+- [Amazon EventBridge — retry e DLQ](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-rule-retry-policy.html)
+- [AWS CLI — test-event-pattern](https://docs.aws.amazon.com/cli/latest/reference/events/test-event-pattern.html)
+- [AWS CLI — put-events](https://docs.aws.amazon.com/cli/latest/reference/events/put-events.html)
 - [Amazon CloudWatch Logs — FilterLogEvents API](https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_FilterLogEvents.html)
 - [Terraform plan command](https://developer.hashicorp.com/terraform/cli/commands/plan)
 - [MITRE ATT&CK T1496.001 — Compute Hijacking](https://attack.mitre.org/techniques/T1496/001/)
