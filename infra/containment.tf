@@ -12,10 +12,6 @@ data "archive_file" "containment" {
   }
 }
 
-data "aws_kms_alias" "sns" {
-  name = "alias/aws/sns"
-}
-
 data "aws_iam_policy_document" "containment_assume_role" {
   statement {
     sid     = "AllowLambdaServiceToAssumeRole"
@@ -151,7 +147,7 @@ data "aws_iam_policy_document" "containment_permissions" {
     ]
 
     resources = [
-      data.aws_kms_alias.sns.target_key_arn,
+      aws_kms_key.incident_notifications.arn,
     ]
   }
 }

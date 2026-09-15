@@ -106,7 +106,7 @@ resource "aws_dynamodb_table" "incidents" {
 resource "aws_sns_topic" "incidents" {
   name              = "${var.project_name}-notifications"
   display_name      = "Cloud IR Lab"
-  kms_master_key_id = "alias/aws/sns"
+  kms_master_key_id = aws_kms_key.incident_notifications.arn
 
   tags = {
     Name    = "${var.project_name}-notifications"
