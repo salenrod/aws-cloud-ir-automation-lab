@@ -98,6 +98,24 @@ function Write-Utf8NoBomJson {
     [System.IO.File]::WriteAllText($Path, $json, $utf8NoBom)
 }
 
+function Convert-HexToBase64 {
+    param(
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-fA-F]{64}$')]
+        [string]$Hex
+    )
+
+    $bytes = New-Object byte[] 32
+    for ($index = 0; $index -lt $bytes.Length; $index++) {
+        $bytes[$index] = [Convert]::ToByte(
+            $Hex.Substring($index * 2, 2),
+            16
+        )
+    }
+
+    return [Convert]::ToBase64String($bytes)
+}
+
 function Get-TagMap {
     param(
         [Parameter(Mandatory)]
@@ -343,6 +361,9 @@ try {
     $incidentsTableName = Invoke-TerraformOutput `
         -InfraDirectory $infraDirectory `
         -Name "incidents_table_name"
+    $evidenceBucketName = Invoke-TerraformOutput `
+        -InfraDirectory $infraDirectory `
+        -Name "evidence_bucket_name"
 
     $containmentConfiguration = Invoke-AwsJson -Arguments @(
         "lambda", "get-function-configuration",
@@ -371,6 +392,14 @@ try {
         -Condition ($containmentConfiguration.Handler -eq "handler.lambda_handler") `
         -Name "Containment Lambda handler" `
         -Detail "Handler=$($containmentConfiguration.Handler)"
+
+    Assert-Test `
+        -Condition (
+            $containmentConfiguration.Environment.Variables.EVIDENCE_BUCKET_NAME -eq
+            $evidenceBucketName
+        ) `
+        -Name "Containment evidence bucket configuration" `
+        -Detail "Bucket=terraform-output-confirmed"
 
     $initialInstance = Get-LabInstance -InstanceId $labInstanceId
     $initialTags = Get-TagMap -Instance $initialInstance
@@ -444,6 +473,7 @@ try {
     $containmentResponsePath = Join-Path $script:TemporaryDirectory "containment-response.json"
     $duplicateResponsePath = Join-Path $script:TemporaryDirectory "containment-duplicate-response.json"
     $dynamoKeyPath = Join-Path $script:TemporaryDirectory "dynamodb-key.json"
+    $evidenceObjectPath = Join-Path $script:TemporaryDirectory "pre-containment-evidence.json"
 
     $event = Get-Content -LiteralPath $eventTemplatePath -Raw | ConvertFrom-Json
     $incidentId = (
@@ -528,6 +558,35 @@ try {
         -Condition ($containmentResult.notification_status -eq "published") `
         -Name "Containment notification published" `
         -Detail "NotificationStatus=published"
+
+    $expectedEvidenceKey = "incidents/$incidentId/pre-containment.json"
+    $evidenceReference = $containmentResult.evidence
+
+    Assert-Test `
+        -Condition (
+            $evidenceReference.bucket -eq $evidenceBucketName -and
+            $evidenceReference.key -eq $expectedEvidenceKey
+        ) `
+        -Name "Pre-containment evidence location" `
+        -Detail "Key=$expectedEvidenceKey"
+
+    Assert-Test `
+        -Condition (
+            $evidenceReference.status -eq "created" -and
+            -not [string]::IsNullOrWhiteSpace(
+                [string]$evidenceReference.version_id
+            )
+        ) `
+        -Name "Immutable evidence version" `
+        -Detail "Status=created; VersionId=present"
+
+    Assert-Test `
+        -Condition (
+            [string]$evidenceReference.sha256 -match
+            '^[0-9a-f]{64}$'
+        ) `
+        -Name "Evidence SHA-256 reference" `
+        -Detail "Sha256=present"
 
     Assert-Test `
         -Condition (
@@ -639,6 +698,95 @@ try {
         -Name "DynamoDB processing lease released" `
         -Detail "lease_until=absent"
 
+    Assert-Test `
+        -Condition (
+            $incidentItem.evidence_bucket.S -eq $evidenceBucketName -and
+            $incidentItem.evidence_key.S -eq $expectedEvidenceKey
+        ) `
+        -Name "DynamoDB evidence location" `
+        -Detail "BucketAndKey=confirmed"
+
+    Assert-Test `
+        -Condition (
+            $incidentItem.evidence_sha256.S -eq
+            [string]$evidenceReference.sha256 -and
+            $incidentItem.evidence_version_id.S -eq
+            [string]$evidenceReference.version_id
+        ) `
+        -Name "DynamoDB evidence integrity reference" `
+        -Detail "ChecksumAndVersion=confirmed"
+
+    $evidenceDownload = Invoke-AwsJson -Arguments @(
+        "s3api", "get-object",
+        "--bucket", $evidenceBucketName,
+        "--key", $expectedEvidenceKey,
+        "--version-id", ([string]$evidenceReference.version_id),
+        "--checksum-mode", "ENABLED",
+        "--profile", $Profile,
+        "--region", $Region,
+        "--output", "json",
+        $evidenceObjectPath
+    )
+
+    $localEvidenceSha256 = (
+        Get-FileHash `
+            -LiteralPath $evidenceObjectPath `
+            -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    $expectedChecksumSha256 = Convert-HexToBase64 `
+        -Hex ([string]$evidenceReference.sha256)
+
+    Assert-Test `
+        -Condition (
+            $localEvidenceSha256 -eq [string]$evidenceReference.sha256 -and
+            $evidenceDownload.ChecksumSHA256 -eq $expectedChecksumSha256
+        ) `
+        -Name "Downloaded evidence checksum" `
+        -Detail "LocalAndS3Checksums=confirmed"
+
+    Assert-Test `
+        -Condition (
+            $evidenceDownload.VersionId -eq
+            [string]$evidenceReference.version_id -and
+            $evidenceDownload.ServerSideEncryption -eq "AES256"
+        ) `
+        -Name "Evidence version and encryption" `
+        -Detail "VersionId=confirmed; SSE=AES256"
+
+    $evidenceDocument = Get-Content `
+        -LiteralPath $evidenceObjectPath `
+        -Raw |
+        ConvertFrom-Json
+    $evidenceSecurityGroups = @(
+        $evidenceDocument.instance.security_group_ids
+    )
+
+    Assert-Test `
+        -Condition (
+            $evidenceDocument.schema_version -eq "1.0" -and
+            $evidenceDocument.evidence_type -eq "pre-containment" -and
+            $evidenceDocument.incident.id -eq $incidentId
+        ) `
+        -Name "Evidence document contract" `
+        -Detail "Schema=1.0; Type=pre-containment"
+
+    Assert-Test `
+        -Condition (
+            $evidenceDocument.resource.instance_id -eq $labInstanceId -and
+            $evidenceDocument.decision.containment_eligible -eq $true
+        ) `
+        -Name "Evidence incident decision" `
+        -Detail "InstanceAndDecision=confirmed"
+
+    Assert-Test `
+        -Condition (
+            $evidenceSecurityGroups.Count -eq 1 -and
+            $evidenceSecurityGroups[0] -eq $baselineSecurityGroupId -and
+            $evidenceDocument.instance.tags.IncidentStatus -eq "clean"
+        ) `
+        -Name "Evidence captures pre-containment state" `
+        -Detail "SecurityGroup=baseline; IncidentStatus=clean"
+
     $containedAtBeforeDuplicate = [string]$incidentItem.contained_at.S
 
     $containmentCompleteFound = Find-ContainmentLogEvent `
@@ -680,6 +828,17 @@ try {
         -Condition ($duplicateResult.idempotent -eq $true) `
         -Name "Duplicate is idempotent" `
         -Detail "Idempotent=True"
+
+    Assert-Test `
+        -Condition (
+            $duplicateResult.evidence.key -eq $expectedEvidenceKey -and
+            $duplicateResult.evidence.version_id -eq
+            [string]$evidenceReference.version_id -and
+            $duplicateResult.evidence.sha256 -eq
+            [string]$evidenceReference.sha256
+        ) `
+        -Name "Duplicate preserves evidence reference" `
+        -Detail "KeyChecksumAndVersionUnchanged=True"
 
     $incidentItemAfterDuplicate = Get-IncidentItem `
         -TableName $incidentsTableName `
@@ -732,6 +891,9 @@ try {
     Write-Host "Instance state: $($finalInstance.State.Name)"
     Write-Host "Security group: $quarantineSecurityGroupId"
     Write-Host "Incident tag:   $($finalTags['IncidentStatus'])"
+    Write-Host "S3 evidence:    s3://$evidenceBucketName/$expectedEvidenceKey"
+    Write-Host "SHA-256:        $($evidenceReference.sha256)"
+    Write-Host "Version ID:     $($evidenceReference.version_id)"
     Write-Host ""
     Write-Host "The lab target remains intentionally quarantined." -ForegroundColor Yellow
     Write-Host "Do not run Test-Foundation.ps1 or Test-Triage.ps1 until the target is reset." -ForegroundColor Yellow

@@ -117,6 +117,24 @@ function Write-Utf8NoBomJson {
     [System.IO.File]::WriteAllText($Path, $json, $utf8NoBom)
 }
 
+function Convert-HexToBase64 {
+    param(
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-fA-F]{64}$')]
+        [string]$Hex
+    )
+
+    $bytes = New-Object byte[] 32
+    for ($index = 0; $index -lt $bytes.Length; $index++) {
+        $bytes[$index] = [Convert]::ToByte(
+            $Hex.Substring($index * 2, 2),
+            16
+        )
+    }
+
+    return [Convert]::ToBase64String($bytes)
+}
+
 function Get-TagMap {
     param(
         [Parameter(Mandatory)]
@@ -435,6 +453,9 @@ try {
         $containmentLogGroupName = Invoke-TerraformOutput `
             -InfraDirectory $infraDirectory `
             -Name "containment_log_group_name"
+        $evidenceBucketName = Invoke-TerraformOutput `
+            -InfraDirectory $infraDirectory `
+            -Name "evidence_bucket_name"
     }
 
     $stateMachine = Invoke-AwsJson -Arguments @(
@@ -558,6 +579,7 @@ try {
     $dynamoItemPath = Join-Path $script:TemporaryDirectory "dynamodb-item.json"
     $cloudWatchQueryPath = Join-Path $script:TemporaryDirectory "cloudwatch-query.json"
     $containmentLogPath = Join-Path $script:TemporaryDirectory "containment-log-event.json"
+    $evidenceObjectPath = Join-Path $script:TemporaryDirectory "pre-containment-evidence.json"
     $incidentPrefix = if ($ExecuteContainment) {
         "orchestration-containment-"
     }
@@ -691,6 +713,35 @@ try {
             -Condition ($workflowResult.notification_status -eq "published") `
             -Name "Workflow containment notification published" `
             -Detail "NotificationStatus=published"
+
+        $expectedEvidenceKey = "incidents/$incidentId/pre-containment.json"
+        $evidenceReference = $workflowResult.evidence
+
+        Assert-Test `
+            -Condition (
+                $evidenceReference.bucket -eq $evidenceBucketName -and
+                $evidenceReference.key -eq $expectedEvidenceKey
+            ) `
+            -Name "Workflow evidence location" `
+            -Detail "Key=$expectedEvidenceKey"
+
+        Assert-Test `
+            -Condition (
+                $evidenceReference.status -eq "created" -and
+                -not [string]::IsNullOrWhiteSpace(
+                    [string]$evidenceReference.version_id
+                )
+            ) `
+            -Name "Workflow immutable evidence version" `
+            -Detail "Status=created; VersionId=present"
+
+        Assert-Test `
+            -Condition (
+                [string]$evidenceReference.sha256 -match
+                '^[0-9a-f]{64}$'
+            ) `
+            -Name "Workflow evidence SHA-256 reference" `
+            -Detail "Sha256=present"
 
         Assert-Test `
             -Condition (
@@ -865,6 +916,99 @@ try {
             -Name "DynamoDB processing lease released" `
             -Detail "lease_until=absent"
 
+        Assert-Test `
+            -Condition (
+                $incidentItem.evidence_bucket.S -eq $evidenceBucketName -and
+                $incidentItem.evidence_key.S -eq $expectedEvidenceKey
+            ) `
+            -Name "DynamoDB evidence location" `
+            -Detail "BucketAndKey=confirmed"
+
+        Assert-Test `
+            -Condition (
+                $incidentItem.evidence_sha256.S -eq
+                [string]$evidenceReference.sha256 -and
+                $incidentItem.evidence_version_id.S -eq
+                [string]$evidenceReference.version_id
+            ) `
+            -Name "DynamoDB evidence integrity reference" `
+            -Detail "ChecksumAndVersion=confirmed"
+
+        $evidenceDownload = Invoke-AwsJson -Arguments @(
+            "s3api", "get-object",
+            "--bucket", $evidenceBucketName,
+            "--key", $expectedEvidenceKey,
+            "--version-id", ([string]$evidenceReference.version_id),
+            "--checksum-mode", "ENABLED",
+            "--profile", $Profile,
+            "--region", $Region,
+            "--output", "json",
+            $evidenceObjectPath
+        )
+
+        $localEvidenceSha256 = (
+            Get-FileHash `
+                -LiteralPath $evidenceObjectPath `
+                -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
+        $expectedChecksumSha256 = Convert-HexToBase64 `
+            -Hex ([string]$evidenceReference.sha256)
+
+        Assert-Test `
+            -Condition (
+                $localEvidenceSha256 -eq
+                [string]$evidenceReference.sha256 -and
+                $evidenceDownload.ChecksumSHA256 -eq
+                $expectedChecksumSha256
+            ) `
+            -Name "Downloaded workflow evidence checksum" `
+            -Detail "LocalAndS3Checksums=confirmed"
+
+        Assert-Test `
+            -Condition (
+                $evidenceDownload.VersionId -eq
+                [string]$evidenceReference.version_id -and
+                $evidenceDownload.ServerSideEncryption -eq "AES256"
+            ) `
+            -Name "Workflow evidence version and encryption" `
+            -Detail "VersionId=confirmed; SSE=AES256"
+
+        $evidenceDocument = Get-Content `
+            -LiteralPath $evidenceObjectPath `
+            -Raw |
+            ConvertFrom-Json
+        $evidenceSecurityGroups = @(
+            $evidenceDocument.instance.security_group_ids
+        )
+
+        Assert-Test `
+            -Condition (
+                $evidenceDocument.schema_version -eq "1.0" -and
+                $evidenceDocument.evidence_type -eq "pre-containment" -and
+                $evidenceDocument.incident.id -eq $incidentId
+            ) `
+            -Name "Workflow evidence document contract" `
+            -Detail "Schema=1.0; Type=pre-containment"
+
+        Assert-Test `
+            -Condition (
+                $evidenceDocument.resource.instance_id -eq
+                $labInstanceId -and
+                $evidenceDocument.decision.containment_eligible -eq $true
+            ) `
+            -Name "Workflow evidence incident decision" `
+            -Detail "InstanceAndDecision=confirmed"
+
+        Assert-Test `
+            -Condition (
+                $evidenceSecurityGroups.Count -eq 1 -and
+                $evidenceSecurityGroups[0] -eq
+                $baselineSecurityGroupId -and
+                $evidenceDocument.instance.tags.IncidentStatus -eq "clean"
+            ) `
+            -Name "Workflow evidence pre-containment state" `
+            -Detail "SecurityGroup=baseline; IncidentStatus=clean"
+
         Write-Utf8NoBomJson -Value $execution -Path $executionPath
         Write-Utf8NoBomJson -Value $executionHistory -Path $executionHistoryPath
         Write-Utf8NoBomJson -Value $incidentItem -Path $dynamoItemPath
@@ -881,6 +1025,12 @@ try {
             -Detail "event=containment_complete"
 
         Write-Utf8NoBomJson -Value $containmentLogEvent -Path $containmentLogPath
+
+        Write-Host ""
+        Write-Host "Preserved S3 evidence"
+        Write-Host "Object:     s3://$evidenceBucketName/$expectedEvidenceKey"
+        Write-Host "SHA-256:    $($evidenceReference.sha256)"
+        Write-Host "Version ID: $($evidenceReference.version_id)"
     }
     else {
         Assert-Test `

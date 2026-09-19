@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import os
 from copy import deepcopy
 from typing import Any
@@ -19,13 +22,19 @@ from src.containment import handler  # noqa: E402
 INSTANCE_ID = "i-0123456789abcdef0"
 BASELINE_SG_ID = "sg-0123456789abcdef0"
 QUARANTINE_SG_ID = "sg-0fedcba9876543210"
+EVIDENCE_BUCKET = "cloud-ir-lab-synthetic-evidence"
 
 
 class FakeEC2Client:
     """State-aware fake for the EC2 calls made by containment."""
 
-    def __init__(self, response: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        response: dict[str, Any],
+        operations: list[str] | None = None,
+    ) -> None:
         self.response = deepcopy(response)
+        self.operations = operations
         self.describe_calls: list[list[str]] = []
         self.modify_calls: list[dict[str, Any]] = []
         self.tag_calls: list[dict[str, Any]] = []
@@ -44,6 +53,8 @@ class FakeEC2Client:
         InstanceId: str,
         Groups: list[str],
     ) -> None:
+        if self.operations is not None:
+            self.operations.append("ec2:ModifyInstanceAttribute")
         self.modify_calls.append(
             {
                 "InstanceId": InstanceId,
@@ -91,6 +102,7 @@ class FakeIncidentTable:
         if (
             "attribute_not_exists" in condition
             and self.existing_item is not None
+            and self.existing_item.get("status") != "failed"
         ):
             raise ClientError(
                 {
@@ -101,6 +113,12 @@ class FakeIncidentTable:
                 },
                 "UpdateItem",
             )
+
+        if (
+            "attribute_not_exists" in condition
+            and self.existing_item is not None
+        ):
+            return {"Attributes": deepcopy(self.existing_item)}
 
         return {}
 
@@ -145,6 +163,89 @@ class FakeSNSClient:
                 "Publish",
             )
         return {"MessageId": "synthetic-message-id"}
+
+
+class FakeS3Body:
+    """Provide the streaming-body method used by get_object."""
+
+    def __init__(self, value: bytes) -> None:
+        self.value = value
+
+    def read(self) -> bytes:
+        return self.value
+
+
+class FakeS3Client:
+    """Capture checksum-protected evidence writes and reads."""
+
+    def __init__(
+        self,
+        *,
+        fail_put: bool = False,
+        corrupt_read: bool = False,
+        existing_body: bytes | None = None,
+        operations: list[str] | None = None,
+    ) -> None:
+        self.fail_put = fail_put
+        self.corrupt_read = corrupt_read
+        self.body = existing_body
+        self.operations = operations
+        self.version_id = "synthetic-version-1"
+        self.put_calls: list[dict[str, Any]] = []
+        self.get_calls: list[dict[str, Any]] = []
+
+    def put_object(self, **kwargs: Any) -> dict[str, str]:
+        self.put_calls.append(deepcopy(kwargs))
+        if self.operations is not None:
+            self.operations.append("s3:PutObject")
+
+        if self.fail_put:
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "ServiceUnavailable",
+                        "Message": "Synthetic S3 failure",
+                    }
+                },
+                "PutObject",
+            )
+
+        if self.body is not None:
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "PreconditionFailed",
+                        "Message": "Object already exists",
+                    }
+                },
+                "PutObject",
+            )
+
+        self.body = bytes(kwargs["Body"])
+        return {
+            "ChecksumSHA256": kwargs["ChecksumSHA256"],
+            "VersionId": self.version_id,
+        }
+
+    def get_object(self, **kwargs: Any) -> dict[str, Any]:
+        self.get_calls.append(deepcopy(kwargs))
+        if self.operations is not None:
+            self.operations.append("s3:GetObject")
+
+        if self.body is None:
+            raise AssertionError("Evidence was read before it existed.")
+
+        returned_body = (
+            self.body + b"corrupted" if self.corrupt_read else self.body
+        )
+        checksum = base64.b64encode(
+            hashlib.sha256(returned_body).digest()
+        ).decode("ascii")
+        return {
+            "Body": FakeS3Body(returned_body),
+            "ChecksumSHA256": checksum,
+            "VersionId": self.version_id,
+        }
 
 
 def build_triage_result(
@@ -196,8 +297,18 @@ def build_ec2_response(
             {
                 "Instances": [
                     {
+                        "Architecture": "x86_64",
+                        "ImageId": "ami-0123456789abcdef0",
                         "InstanceId": INSTANCE_ID,
+                        "InstanceType": "t3.micro",
+                        "Placement": {
+                            "AvailabilityZone": "us-east-1a",
+                        },
+                        "PrivateIpAddress": "10.0.1.10",
+                        "RootDeviceName": "/dev/xvda",
                         "State": {"Name": state},
+                        "SubnetId": "subnet-0123456789abcdef0",
+                        "VpcId": "vpc-0123456789abcdef0",
                         "SecurityGroups": [
                             {
                                 "GroupId": security_group_id,
@@ -239,11 +350,13 @@ def configure_handler(
     ec2: FakeEC2Client,
     table: FakeIncidentTable,
     sns: FakeSNSClient,
+    s3: FakeS3Client | None = None,
 ) -> None:
     """Inject deterministic clients and deployment settings."""
 
     monkeypatch.setattr(handler, "EC2_CLIENT", ec2)
     monkeypatch.setattr(handler, "SNS_CLIENT", sns)
+    monkeypatch.setattr(handler, "S3_CLIENT", s3 or FakeS3Client())
     monkeypatch.setattr(
         handler,
         "DYNAMODB_RESOURCE",
@@ -258,6 +371,11 @@ def configure_handler(
         handler,
         "INCIDENT_TOPIC_ARN",
         "arn:aws:sns:us-east-1:111122223333:synthetic-topic",
+    )
+    monkeypatch.setattr(
+        handler,
+        "EVIDENCE_BUCKET_NAME",
+        EVIDENCE_BUCKET,
     )
     monkeypatch.setattr(handler, "TARGET_INSTANCE_ID", INSTANCE_ID)
     monkeypatch.setattr(
@@ -277,14 +395,17 @@ def test_eligible_finding_is_contained(
 ) -> None:
     """An authorized target is moved from baseline to quarantine."""
 
-    ec2 = FakeEC2Client(build_ec2_response())
+    operations: list[str] = []
+    ec2 = FakeEC2Client(build_ec2_response(), operations=operations)
     table = FakeIncidentTable()
     sns = FakeSNSClient()
+    s3 = FakeS3Client(operations=operations)
     configure_handler(
         monkeypatch,
         ec2=ec2,
         table=table,
         sns=sns,
+        s3=s3,
     )
 
     result = handler.lambda_handler(build_triage_result(), context=None)
@@ -293,6 +414,34 @@ def test_eligible_finding_is_contained(
     assert result["changed"] is True
     assert result["security_group_ids_before"] == [BASELINE_SG_ID]
     assert result["security_group_ids_after"] == [QUARANTINE_SG_ID]
+    assert result["evidence"] == {
+        "bucket": EVIDENCE_BUCKET,
+        "key": (
+            "incidents/sample-guardduty-compute-hijacking/"
+            "pre-containment.json"
+        ),
+        "sha256": hashlib.sha256(s3.body or b"").hexdigest(),
+        "checksum_sha256": s3.put_calls[0]["ChecksumSHA256"],
+        "version_id": "synthetic-version-1",
+        "status": "created",
+    }
+    assert operations[:3] == [
+        "s3:PutObject",
+        "s3:GetObject",
+        "ec2:ModifyInstanceAttribute",
+    ]
+    assert s3.put_calls[0]["IfNoneMatch"] == "*"
+    assert s3.put_calls[0]["ChecksumAlgorithm"] == "SHA256"
+    assert s3.put_calls[0]["ServerSideEncryption"] == "AES256"
+    evidence_document = json.loads((s3.body or b"").decode("utf-8"))
+    assert evidence_document["evidence_type"] == "pre-containment"
+    assert evidence_document["incident"]["id"] == result["incident_id"]
+    assert evidence_document["instance"]["security_group_ids"] == [
+        BASELINE_SG_ID
+    ]
+    assert evidence_document["instance"]["tags"][
+        "IncidentStatus"
+    ] == "clean"
     assert ec2.modify_calls == [
         {
             "InstanceId": INSTANCE_ID,
@@ -310,7 +459,14 @@ def test_eligible_finding_is_contained(
             ],
         }
     ]
-    assert len(table.update_calls) == 2
+    assert len(table.update_calls) == 3
+    evidence_values = table.update_calls[1][
+        "ExpressionAttributeValues"
+    ]
+    assert evidence_values[":evidence_key"] == result["evidence"]["key"]
+    assert evidence_values[":evidence_sha256"] == result["evidence"][
+        "sha256"
+    ]
     assert len(sns.publish_calls) == 1
 
 
@@ -508,7 +664,192 @@ def test_notification_failure_marks_incident_failed(
 
     assert len(ec2.modify_calls) == 1
     assert len(sns.publish_calls) == 1
-    assert len(table.update_calls) == 2
+    assert len(table.update_calls) == 3
     assert ":failed" in (
         table.update_calls[-1]["ExpressionAttributeValues"]
     )
+
+
+def test_evidence_failure_blocks_ec2_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S3 evidence failure is fail-closed before any EC2 mutation."""
+
+    ec2 = FakeEC2Client(build_ec2_response())
+    table = FakeIncidentTable()
+    sns = FakeSNSClient()
+    s3 = FakeS3Client(fail_put=True)
+    configure_handler(
+        monkeypatch,
+        ec2=ec2,
+        table=table,
+        sns=sns,
+        s3=s3,
+    )
+
+    with pytest.raises(ClientError):
+        handler.lambda_handler(build_triage_result(), context=None)
+
+    assert len(s3.put_calls) == 1
+    assert s3.get_calls == []
+    assert ec2.modify_calls == []
+    assert ec2.tag_calls == []
+    assert sns.publish_calls == []
+    assert len(table.update_calls) == 2
+    assert table.update_calls[-1]["ExpressionAttributeValues"][
+        ":failed"
+    ] == "failed"
+
+
+def test_failed_retry_reuses_verified_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed incident retry reads its exact S3 version without overwrite."""
+
+    event = build_triage_result()
+    ec2 = FakeEC2Client(build_ec2_response())
+    snapshot = {
+        "architecture": "x86_64",
+        "availability_zone": "us-east-1a",
+        "iam_instance_profile_arn": None,
+        "image_id": "ami-0123456789abcdef0",
+        "instance_id": INSTANCE_ID,
+        "instance_type": "t3.micro",
+        "launch_time": None,
+        "state": "running",
+        "private_ip_address": "10.0.1.10",
+        "root_device_name": "/dev/xvda",
+        "security_group_ids": [BASELINE_SG_ID],
+        "subnet_id": "subnet-0123456789abcdef0",
+        "network_interface_ids": ["eni-00000000000000000"],
+        "tags": {
+            "AutoContainment": "true",
+            "IncidentStatus": "clean",
+            "DataClassification": "synthetic",
+        },
+        "vpc_id": "vpc-0123456789abcdef0",
+    }
+    evidence_document = handler._build_precontainment_evidence(
+        event=event,
+        incident_id=event["incident_id"],
+        instance=snapshot,
+        collected_at="2026-09-15T00:00:00+00:00",
+    )
+    evidence_body = handler._canonical_json_bytes(evidence_document)
+    evidence_sha256 = hashlib.sha256(evidence_body).hexdigest()
+    evidence_key = (
+        "incidents/sample-guardduty-compute-hijacking/"
+        "pre-containment.json"
+    )
+    table = FakeIncidentTable(
+        existing_item={
+            "incident_id": event["incident_id"],
+            "status": "failed",
+            "evidence_bucket": EVIDENCE_BUCKET,
+            "evidence_key": evidence_key,
+            "evidence_sha256": evidence_sha256,
+            "evidence_version_id": "synthetic-version-1",
+        }
+    )
+    sns = FakeSNSClient()
+    s3 = FakeS3Client(existing_body=evidence_body)
+    configure_handler(
+        monkeypatch,
+        ec2=ec2,
+        table=table,
+        sns=sns,
+        s3=s3,
+    )
+
+    result = handler.lambda_handler(event, context=None)
+
+    assert result["status"] == "contained"
+    assert result["evidence"]["status"] == "reused"
+    assert result["evidence"]["version_id"] == "synthetic-version-1"
+    assert s3.put_calls == []
+    assert len(s3.get_calls) == 1
+    assert s3.get_calls[0]["VersionId"] == "synthetic-version-1"
+    assert len(ec2.modify_calls) == 1
+
+
+def test_evidence_checksum_failure_blocks_ec2_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A checksum mismatch aborts before quarantine or notification."""
+
+    ec2 = FakeEC2Client(build_ec2_response())
+    table = FakeIncidentTable()
+    sns = FakeSNSClient()
+    s3 = FakeS3Client(corrupt_read=True)
+    configure_handler(
+        monkeypatch,
+        ec2=ec2,
+        table=table,
+        sns=sns,
+        s3=s3,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Stored evidence SHA-256 verification failed",
+    ):
+        handler.lambda_handler(build_triage_result(), context=None)
+
+    assert len(s3.put_calls) == 1
+    assert len(s3.get_calls) == 1
+    assert ec2.modify_calls == []
+    assert ec2.tag_calls == []
+    assert sns.publish_calls == []
+    assert len(table.update_calls) == 2
+
+
+def test_retry_recovers_evidence_written_before_ledger_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry can bind a valid object left by a partial prior attempt."""
+
+    event = build_triage_result()
+    snapshot = {
+        "instance_id": INSTANCE_ID,
+        "state": "running",
+        "security_group_ids": [BASELINE_SG_ID],
+        "network_interface_ids": ["eni-00000000000000000"],
+        "tags": {
+            "AutoContainment": "true",
+            "IncidentStatus": "clean",
+            "DataClassification": "synthetic",
+        },
+    }
+    document = handler._build_precontainment_evidence(
+        event=event,
+        incident_id=event["incident_id"],
+        instance=snapshot,
+        collected_at="2026-09-15T00:00:00+00:00",
+    )
+    s3 = FakeS3Client(
+        existing_body=handler._canonical_json_bytes(document)
+    )
+    ec2 = FakeEC2Client(build_ec2_response())
+    table = FakeIncidentTable(
+        existing_item={
+            "incident_id": event["incident_id"],
+            "status": "failed",
+        }
+    )
+    sns = FakeSNSClient()
+    configure_handler(
+        monkeypatch,
+        ec2=ec2,
+        table=table,
+        sns=sns,
+        s3=s3,
+    )
+
+    result = handler.lambda_handler(event, context=None)
+
+    assert result["status"] == "contained"
+    assert result["evidence"]["status"] == "reused"
+    assert len(s3.put_calls) == 1
+    assert len(s3.get_calls) == 1
+    assert "VersionId" not in s3.get_calls[0]
+    assert len(ec2.modify_calls) == 1

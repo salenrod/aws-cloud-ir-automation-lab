@@ -17,6 +17,7 @@ flowchart TD
     B --> C{"Containment eligible?"}
     C -->|Yes| D["ContainTarget"]
     C -->|No| E["NoContainmentRequired"]
+    D --> F["Verified S3 evidence, then EC2 quarantine"]
 ```
 
 The workflow is a Step Functions Standard Workflow. Its execution role can invoke only the triage and containment Lambda functions managed by this laboratory.
@@ -56,7 +57,7 @@ By default, `Test-Orchestration.ps1` performs the following checks:
 
 The test does not insert a containment record into DynamoDB because the containment Lambda is intentionally not invoked on the skip path.
 
-The optional `-ExecuteContainment` mode adds fail-closed preconditions, executes the eligible path, collects control-plane evidence and restores the disposable target in a `finally` block.
+The optional `-ExecuteContainment` mode adds fail-closed preconditions, executes the eligible path, validates the versioned pre-containment evidence in S3, collects control-plane evidence and restores the disposable target in a `finally` block.
 
 ## Commands
 
@@ -178,6 +179,15 @@ Terraform drift: No changes, exit code 0
 
 The eligible execution reached `TriageFinding`, `EvaluateContainmentEligibility` and `ContainTarget`; recorded `status=contained` in DynamoDB; published the SNS notification; emitted `containment_complete`; and returned the target to `IncidentStatus=clean` with only the baseline security group.
 
+That 40-check result predates automatic S3 evidence preservation. The updated validator adds ten assertions for the response and DynamoDB references, exact S3 version, encryption, S3 checksum, locally recomputed SHA-256, document contract, eligible decision and baseline instance state. After deployment, the expected eligible-path summary is:
+
+```text
+Passed: 50
+Failed: 0
+```
+
+The existing safe-skip path remains read-only and keeps its 23-check expectation.
+
 ### Diagnostic artifacts
 
 The script preserves a temporary evidence directory and prints its path. It can contain:
@@ -191,6 +201,7 @@ The script preserves a temporary evidence directory and prints its path. It can 
 | `dynamodb-item.json` | Persisted containment status and metadata |
 | `cloudwatch-query.json` | Raw CloudWatch Logs query response |
 | `containment-log-event.json` | Correlated structured completion event |
+| `pre-containment-evidence.json` | Exact S3 object version downloaded and checksum-verified before recovery |
 | `recovery-state.json` | Verified EC2 state after automatic recovery |
 
 These artifacts are intentionally excluded from Git because they contain account-specific identifiers.
@@ -254,11 +265,13 @@ After clearing the local DNS cache, the next Terraform plan returned `No changes
 - The choice has an explicit default skip path.
 - Missing or false eligibility never falls through to containment.
 - The containment Lambda independently revalidates the instance, tags, interface count and security groups.
+- The containment Lambda writes and verifies versioned S3 evidence before changing EC2.
+- The DynamoDB ledger binds the incident to the S3 bucket, key, SHA-256 and version ID.
 - No real account ID, ARN, instance ID or security group ID is stored in this document.
 
 ## Next evolution
 
-Connect the state machine to a narrowly scoped EventBridge rule so a synthetic GuardDuty-shaped event can start the workflow without a manual PowerShell invocation. A production-oriented version should add human approval, central evidence storage and recovery orchestration that does not depend on the analyst workstation.
+Add human approval and a recovery path inside the workflow so authorized rollback no longer depends on the analyst workstation. A production-oriented version should also add EBS snapshots or other forensic acquisition, retention/legal-hold policy and cross-account evidence storage.
 
 ## References
 
@@ -268,4 +281,5 @@ Connect the state machine to a narrowly scoped EventBridge rule so a synthetic G
 - [GetExecutionHistory API](https://docs.aws.amazon.com/step-functions/latest/apireference/API_GetExecutionHistory.html)
 - [FilterLogEvents API](https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_FilterLogEvents.html)
 - [DynamoDB time to live](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html)
+- [Amazon S3 checking object integrity](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html)
 - [AWS Step Functions pricing](https://aws.amazon.com/step-functions/pricing/)

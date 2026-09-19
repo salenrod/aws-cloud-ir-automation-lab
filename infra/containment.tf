@@ -125,6 +125,21 @@ data "aws_iam_policy_document" "containment_permissions" {
   }
 
   statement {
+    sid    = "PreservePreContainmentEvidence"
+    effect = "Allow"
+
+    actions = [
+      "s3:GetObject",
+      "s3:GetObjectVersion",
+      "s3:PutObject",
+    ]
+
+    resources = [
+      "${aws_s3_bucket.evidence.arn}/incidents/*",
+    ]
+  }
+
+  statement {
     sid    = "PublishIncidentNotification"
     effect = "Allow"
 
@@ -177,6 +192,7 @@ resource "aws_lambda_function" "containment" {
     variables = {
       INCIDENTS_TABLE_NAME         = aws_dynamodb_table.incidents.name
       INCIDENT_TOPIC_ARN           = aws_sns_topic.incidents.arn
+      EVIDENCE_BUCKET_NAME         = aws_s3_bucket.evidence.bucket
       TARGET_INSTANCE_ID           = aws_instance.lab_target.id
       BASELINE_SECURITY_GROUP_ID   = aws_security_group.baseline.id
       QUARANTINE_SECURITY_GROUP_ID = aws_security_group.quarantine.id

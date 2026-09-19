@@ -2,7 +2,7 @@
 
 Laboratório de resposta a incidentes em AWS que transforma triagem e contenção de uma instância EC2 em código. O projeto usa Terraform, AWS Lambda, Python e PowerShell para validar um fluxo controlado, auditável e idempotente, baseado em um finding sintético do Amazon GuardDuty.
 
-> Status atual: fundação segura, triagem, contenção controlada, orquestração com AWS Step Functions, ingestão sintética por Amazon EventBridge e observabilidade operacional com CloudWatch, SNS e KMS implementadas e validadas em AWS.
+> Status atual: fundação segura, triagem, contenção controlada, orquestração com AWS Step Functions, ingestão sintética por Amazon EventBridge e observabilidade operacional com CloudWatch, SNS e KMS validadas em AWS. A preservação de evidência S3 antes da contenção está implementada e aguarda a validação controlada após o próximo deploy.
 
 ## Objetivos
 
@@ -18,6 +18,8 @@ Este projeto foi construído para demonstrar competências práticas esperadas e
 - alertar falhas operacionais por um tópico SNS criptografado com chave KMS do projeto;
 - implementar privilégio mínimo com IAM;
 - preservar estado e idempotência com DynamoDB;
+- preservar evidência normalizada e versionada no S3 antes de qualquer mutação da EC2;
+- verificar integridade com checksum SHA-256 do S3 e hash recalculado após leitura;
 - registrar evidências operacionais em CloudWatch Logs;
 - notificar a operação por SNS;
 - provisionar e validar a infraestrutura com Terraform;
@@ -45,7 +47,9 @@ flowchart TD
     D --> E{"Contenção elegível?"}
     E -->|Sim| F["Lambda de contenção"]
     E -->|Não| G["Finalizar sem alteração"]
-    F --> H["EC2, DynamoDB, SNS e logs"]
+    F --> H["Evidência S3 versionada"]
+    H --> K["DynamoDB e quarentena EC2"]
+    K --> L["SNS e logs"]
     B --> I["CloudWatch dashboard e alarmes"]
     C --> I
     D --> I
@@ -53,7 +57,7 @@ flowchart TD
     I --> J["SNS criptografado com KMS"]
 ```
 
-Uma regra EventBridge aceita somente a origem sintética, o detail type de finding e recursos EC2 Instance. O destino é o workflow Standard, que invoca a triagem e usa uma decisão explícita para encaminhar somente findings elegíveis à contenção. Entregas que não alcançam o destino usam política curta de retry e uma SQS DLQ.
+Uma regra EventBridge aceita somente a origem sintética, o detail type de finding e recursos EC2 Instance. O destino é o workflow Standard, que invoca a triagem e usa uma decisão explícita para encaminhar somente findings elegíveis à contenção. Entregas que não alcançam o destino usam política curta de retry e uma SQS DLQ. No caminho elegível, a Lambda cria e verifica uma evidência S3 antes de alterar a EC2; qualquer falha de gravação, leitura, versão ou checksum interrompe a contenção.
 
 O `Test-EventBridge.ps1` valida por padrão o caminho orientado a evento com severidade abaixo do limite, sem executar contenção. O `Test-Orchestration.ps1` também valida o caminho seguro diretamente e exige o parâmetro explícito `-ExecuteContainment` para o caminho elegível. Nesse modo autorizado, o script coleta evidências e restaura automaticamente o alvo no bloco `finally`. A contenção possui validação ponta a ponta independente por `Test-Containment.ps1`.
 
@@ -68,7 +72,7 @@ O dashboard do CloudWatch consolida métricas do EventBridge, SQS, Step Function
 | Security group de quarentena | Bloqueia todo o tráfego durante a contenção |
 | EC2 descartável | Alvo autorizado, sem IP público, com IMDSv2 obrigatório e volume raiz criptografado |
 | Lambda de triagem | Normaliza o finding, consulta EC2, aplica guardrails e mapeia MITRE ATT&CK |
-| Lambda de contenção | Revalida o alvo, troca o security group, altera a tag de estado e confirma a mutação |
+| Lambda de contenção | Revalida o alvo, preserva e verifica a evidência, troca o security group, altera a tag e confirma a mutação |
 | EventBridge | Recebe findings sintéticos em um barramento isolado e encaminha somente eventos compatíveis |
 | SQS DLQ | Preserva eventos cuja entrega ao workflow falha após as tentativas configuradas |
 | Step Functions | Orquestra triagem, decisão e contenção por um workflow Standard auditável |
@@ -78,7 +82,7 @@ O dashboard do CloudWatch consolida métricas do EventBridge, SQS, Step Function
 | CloudWatch Logs | Armazena logs estruturados das Lambdas com retenção limitada |
 | CloudWatch dashboard | Consolida métricas de ingestão, workflow, Lambdas, duração e DLQ |
 | CloudWatch alarms | Detecta falhas operacionais e encaminha alertas ao tópico SNS |
-| S3 de evidências | Bucket privado, versionado e criptografado preparado para evidências do laboratório |
+| S3 de evidências | Guarda o JSON pré-contenção com criação condicional, versionamento, criptografia e checksum SHA-256 |
 | Terraform | Provisiona, atualiza e verifica drift da infraestrutura |
 
 ## Controles de segurança
@@ -98,7 +102,11 @@ A contenção só pode ocorrer quando todas as condições abaixo são satisfeit
 
 A Lambda de contenção consulta novamente a EC2 imediatamente antes da mutação. Ela não confia somente no snapshot produzido pela triagem.
 
+Depois de adquirir o lease do incidente, a função serializa um JSON canônico com finding normalizado, decisão, mapeamento MITRE e estado ao vivo da instância. O objeto é criado em `incidents/<incident-id>/pre-containment.json` com `If-None-Match: *`, checksum SHA-256 e criptografia `AES256`. A mesma versão é lida de volta; o checksum informado pelo S3 e o hash dos bytes baixados precisam coincidir antes de `ec2:ModifyInstanceAttribute`.
+
 As permissões de alteração são limitadas à instância descartável e ao security group de quarentena gerenciados pelo Terraform. Os recursos reais não são codificados diretamente no repositório.
+
+O acesso S3 da Lambda é limitado a `GetObject`, `GetObjectVersion` e `PutObject` sob o prefixo `incidents/*` do bucket de evidências. Ela não recebe permissão para listar, excluir ou alterar a configuração do bucket.
 
 O tópico SNS usa uma chave KMS própria, com rotação automática. A política da chave permite o uso pelo CloudWatch somente para alarmes do laboratório na conta atual. A Lambda de contenção recebe apenas as permissões KMS necessárias para publicar no tópico criptografado.
 
@@ -111,11 +119,12 @@ A tabela DynamoDB utiliza `incident_id` como chave e registra, entre outros camp
 - tipo e severidade do finding;
 - técnica MITRE;
 - security groups antes e depois da contenção;
+- bucket, chave, checksum SHA-256 e version ID da evidência pré-contenção;
 - timestamps de criação, atualização e conclusão;
 - lease temporário de processamento;
 - TTL para expiração dos dados do laboratório.
 
-Uma repetição do mesmo incidente concluído retorna `already_contained`, não modifica novamente a EC2, não repete a notificação e preserva o horário original da conclusão.
+Uma repetição do mesmo incidente concluído retorna `already_contained`, não modifica novamente a EC2, não repete a notificação nem cria outra evidência e preserva o horário original da conclusão. Uma repetição de um incidente `failed` reutiliza somente a versão já registrada no ledger e exige que sua integridade seja confirmada.
 
 ## Estrutura do repositório
 
@@ -285,11 +294,13 @@ Confirme a assinatura recebida por e-mail para que o SNS possa entregar notifica
 python -m pytest ".\tests" -q
 ```
 
-Resultado registrado:
+Resultado registrado antes da ampliação da evidência:
 
 ```text
 13 passed
 ```
+
+A suíte de contenção ampliada possui 12 testes e passou localmente. Depois de substituir os arquivos, execute a suíte completa; com os cinco testes de triagem existentes, o total esperado é `17 passed`.
 
 ### Fundação
 
@@ -326,14 +337,14 @@ Este teste altera o security group e a tag da instância descartável. Revise o 
   -ExecuteContainment
 ```
 
-Resultado registrado:
+Resultado AWS registrado antes da preservação S3:
 
 ```text
 Passed: 54
 Failed: 0
 ```
 
-O teste valida a primeira contenção e repete o mesmo incidente para comprovar idempotência. Ao final, o alvo permanece intencionalmente em quarentena.
+O teste atualizado valida a primeira contenção, baixa a versão exata da evidência, recalcula o SHA-256, compara o checksum devolvido pelo S3 e confirma a referência no DynamoDB. Depois repete o mesmo incidente para comprovar que a mutação, a notificação e a evidência não são duplicadas. O novo resumo esperado, após o deploy, é `Passed: 66` e `Failed: 0`. Ao final, o alvo permanece intencionalmente em quarentena.
 
 ### Orquestração
 
@@ -359,12 +370,14 @@ O caminho elegível é executado somente com autorização explícita:
   -ExecuteContainment
 ```
 
-Resultado registrado:
+Resultado AWS registrado antes da preservação S3:
 
 ```text
 Passed: 40
 Failed: 0
 ```
+
+O teste atualizado acrescenta a validação da evidência S3 e deve terminar com `Passed: 50` e `Failed: 0` depois do deploy. O caminho seguro continua com `23/23` porque não chama a contenção.
 
 Essa execução apresentou:
 
@@ -375,11 +388,12 @@ Recurso alterado:   true
 Idempotente:        false
 Notificação:        published
 Histórico:          TriageFinding -> EvaluateContainmentEligibility -> ContainTarget
-DynamoDB:           status=contained, lease ausente e TTL presente
+DynamoDB:           status=contained, referência S3, lease ausente e TTL presente
+S3:                 versão exata, AES256 e SHA-256 confirmados
 CloudWatch Logs:    event=containment_complete
 ```
 
-O script armazena temporariamente o evento, a descrição e o histórico da execução, o item do DynamoDB, a resposta bruta da consulta ao CloudWatch, o evento de conclusão correlacionado e o estado de recuperação. Esses artefatos permanecem fora do Git porque contêm identificadores específicos da conta.
+O script armazena temporariamente o evento, a descrição e o histórico da execução, o item do DynamoDB, a versão baixada da evidência S3, a resposta bruta da consulta ao CloudWatch, o evento de conclusão correlacionado e o estado de recuperação. Esses artefatos permanecem fora do Git porque contêm identificadores específicos da conta.
 
 Após a coleta, o bloco `finally` restaura o security group baseline e `IncidentStatus=clean`. A regressão final confirmou a recuperação, `26/26` verificações da fundação e ausência de drift no Terraform.
 
@@ -573,7 +587,8 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 - ainda não existe aprovação humana;
 - o modo elegível é explicitamente opt-in e limitado ao alvo descartável; a recuperação local é best-effort e ainda depende de credenciais e conectividade com a AWS;
 - os alertas operacionais são entregues por e-mail; ainda não existe integração com ChatOps, on-call ou uma plataforma de gestão de incidentes;
-- o bucket S3 está preparado para evidências, mas a contenção atual registra seu estado principal no DynamoDB e CloudWatch;
+- a evidência S3 contém finding normalizado, decisão e metadados da instância, mas ainda não inclui snapshot EBS, memória ou coleta dentro do sistema operacional;
+- a retenção S3 segue o ciclo curto do laboratório e ainda não implementa Object Lock, legal hold ou cópia para uma conta forense separada;
 - o alvo suporta somente o cenário controlado de uma instância com uma interface de rede;
 - o laboratório não substitui um processo forense ou uma estratégia de contenção de produção.
 
@@ -581,8 +596,8 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 
 - habilitar GuardDuty e integrar findings reais pelo barramento default em um ambiente dedicado;
 - adicionar aprovação humana e recuperação controlada ao workflow;
-- coletar snapshots e metadados forenses antes da contenção;
-- armazenar evidências normalizadas no S3 com integridade verificável;
+- coletar snapshots EBS e outros artefatos forenses antes da contenção;
+- adicionar Object Lock e replicação para uma conta forense em uma variante de produção;
 - publicar métricas customizadas e indicadores de tempo de triagem, contenção e recuperação;
 - integrar os alarmes a ChatOps ou a uma plataforma de gestão de incidentes;
 - adicionar CI para testes Python, formatação e validação Terraform;
@@ -609,6 +624,8 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 - [Amazon SNS — criptografia em repouso](https://docs.aws.amazon.com/sns/latest/dg/sns-server-side-encryption.html)
 - [Amazon SNS — gerenciamento de chaves KMS](https://docs.aws.amazon.com/sns/latest/dg/sns-key-management.html)
 - [AWS KMS — rotação de chaves](https://docs.aws.amazon.com/kms/latest/developerguide/rotating-keys-enable.html)
+- [Amazon S3 — verificação de integridade de objetos](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html)
+- [Amazon S3 — PutObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html)
 - [Terraform plan command](https://developer.hashicorp.com/terraform/cli/commands/plan)
 - [MITRE ATT&CK T1496.001 — Compute Hijacking](https://attack.mitre.org/techniques/T1496/001/)
 - [NIST Cybersecurity Framework 2.0](https://www.nist.gov/cyberframework)
