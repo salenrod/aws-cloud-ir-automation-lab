@@ -603,6 +603,10 @@ O bucket S3 precisa estar vazio para ser removido, salvo se a configuração def
 - adicionar CI para testes Python, formatação e validação Terraform;
 - adicionar controles DevSecOps, como análise estática e scan de credenciais.
 
+## Licença
+
+Este projeto está licenciado sob a [MIT License](LICENSE).
+
 ## Referências
 
 - [Amazon GuardDuty — EC2 finding types](https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_finding-types-ec2.html)
