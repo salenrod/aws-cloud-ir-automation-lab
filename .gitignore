@@ -56,3 +56,6 @@ infra/*_lambda.zip
 # Generated local test payloads and responses
 events/*-live.json
 events/*-response.json
+
+# Generated Lambda deployment packages
+/src/**/package.zip
